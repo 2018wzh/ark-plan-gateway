@@ -118,7 +118,7 @@ async def test_cross_plan_selection_and_group_cooldown(store):
 
 def test_error_classification():
     now = time.time()
-    assert classify_error(429, b'{"error":{"code":"RateLimitExceeded.EndpointRPMExceeded"}}', {"retry-after":"5"}, now) == ("rate", now+5)
+    assert classify_error(429, b'{"error":{"code":"RateLimitExceeded.EndpointRPMExceeded"}}', {"retry-after":"5"}, now) == ("model_rate", now+5)
     assert classify_error(429, b'{"error":{"code":"QuotaExceeded","message":"You have exceeded the weekly usage quota"}}', {}, now) == ("quota", None)
     assert classify_error(401, b'{}', {}, now) == ("auth", None)
 

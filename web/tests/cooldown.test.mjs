@@ -22,3 +22,16 @@ test('countdown crosses minute and day boundaries without becoming negative',()=
   assert.equal(formatWait(161,162),'0秒');
   assert.equal(formatWait(90161,100),'1天 1小时 1分 1秒');
 });
+
+test('model holds use earliest recoverable route and combine account cooldown',()=>{
+  const models={models:['a','b'],model_mapping:{a:'real-a'},model_blocks:[{model:'real-a',retry_at:130},{model:'b',retry_at:150}]};
+  assert.deepEqual(poolCooldown([account(null,{...models,cooldown_kind:null})],100),{count:1,until:130,exact:true});
+  assert.deepEqual(poolCooldown([account(140,models)],100),{count:1,until:140,exact:true});
+  assert.deepEqual(poolCooldown([account(null,{...models,cooldown_kind:null,models:['a','b','available']})],100),{count:0,until:null,exact:true});
+});
+
+test('manual account holds are not invented quota cooldowns',()=>{
+  assert.deepEqual(poolCooldown([account(null,{cooldown_kind:'account'})],100),{count:0,until:null,exact:true});
+  const models={models:['a','b'],model_blocks:[{model:'a',retry_at:null},{model:'b',retry_at:150}]};
+  assert.deepEqual(poolCooldown([account(null,{...models,cooldown_kind:null})],100),{count:1,until:150,exact:false});
+});

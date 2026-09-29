@@ -79,8 +79,10 @@ async def refresh_account(store: Store, account: dict) -> None:
             for member in store.accounts():
                 if member["quota_group"] == account["quota_group"] and member["plan"] == "agent":
                     state = {"usage_json": json.dumps(usage), "quota_checked_at": now, "quota_error": None}
-                    if exhausted or member["cooldown_kind"] == "quota":
-                        state.update(cooldown_kind="quota" if exhausted else None, cooldown_until=until)
+                    if (exhausted and member["cooldown_kind"] != "account") or member["cooldown_kind"] == "quota":
+                        state.update(cooldown_kind="quota" if exhausted else None, cooldown_until=until,
+                                     cooldown_code="QuotaExceeded.AgentPlanQuotaExceeded" if exhausted else None,
+                                     cooldown_failures=0)
                     store.update(member["id"], **state)
         else:
             result = await management_call("GetCodingPlanUsage", account["access_key"], account["secret_key"], {})
@@ -95,8 +97,9 @@ async def refresh_account(store: Store, account: dict) -> None:
                 if member["quota_group"] == account["quota_group"] and member["plan"] == "coding":
                     state = {"usage_json": json.dumps(usage), "expired": int(expired),
                              "quota_checked_at": now, "quota_error": None}
-                    if exhausted or member["cooldown_kind"] == "quota":
-                        state.update(cooldown_kind="quota" if exhausted else None, cooldown_until=until)
+                    if (exhausted and member["cooldown_kind"] != "account") or member["cooldown_kind"] == "quota":
+                        state.update(cooldown_kind="quota" if exhausted else None, cooldown_until=until,
+                                     cooldown_code="QuotaExceeded" if exhausted else None, cooldown_failures=0)
                     store.update(member["id"], **state)
     except Exception as exc:
         store.update(account["id"], quota_error=f"查询失败：{type(exc).__name__}")

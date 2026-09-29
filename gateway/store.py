@@ -38,6 +38,11 @@ class Store:
           created_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS model_blocks (
+          account_id TEXT NOT NULL, model TEXT NOT NULL, kind TEXT NOT NULL,
+          retry_at REAL, code TEXT NOT NULL, failures INTEGER NOT NULL,
+          PRIMARY KEY (account_id, model)
+        );
         CREATE TABLE IF NOT EXISTS quota_snapshots (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           observed_at REAL NOT NULL, quota_group TEXT NOT NULL, plan TEXT NOT NULL,
@@ -54,6 +59,10 @@ class Store:
         """)
         if "model_mapping" not in {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}:
             self.db.execute("ALTER TABLE accounts ADD COLUMN model_mapping TEXT NOT NULL DEFAULT '{}'")
+        account_columns = {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}
+        for name, sql_type in (("cooldown_failures", "INTEGER NOT NULL DEFAULT 0"), ("cooldown_code", "TEXT")):
+            if name not in account_columns:
+                self.db.execute(f"ALTER TABLE accounts ADD COLUMN {name} {sql_type}")
         columns = {r[1] for r in self.db.execute("PRAGMA table_info(request_daily)")}
         if "context_tokens" not in columns:
             model_column = "model" if "model" in columns else "''"
@@ -96,6 +105,8 @@ class Store:
         d["usage"] = json.loads(d.pop("usage_json"))
         d["api_key_mask"] = "••••" + self._dec(d["api_key"])[-4:]
         d["has_ak_sk"] = bool(d["access_key"] and d["secret_key"])
+        d["model_blocks"] = [dict(r) for r in self.db.execute(
+            "SELECT model,kind,retry_at,code,failures FROM model_blocks WHERE account_id=? ORDER BY model", (d["id"],))]
         if private:
             for k in ("api_key", "access_key", "secret_key"):
                 d[k] = self._dec(d[k])
@@ -128,7 +139,7 @@ class Store:
 
     def update(self, account_id: str, **fields) -> None:
         allowed = {"plan", "label", "quota_group", "models", "model_mapping", "enabled", "auth_failed", "expired",
-                   "cooldown_until", "cooldown_kind", "quota_checked_at", "quota_error", "usage_json", "active"}
+                   "cooldown_until", "cooldown_kind", "cooldown_failures", "cooldown_code", "quota_checked_at", "quota_error", "usage_json", "active"}
         data = {k: v for k, v in fields.items() if k in allowed}
         if "models" in data:
             data["models"] = json.dumps(data["models"])
@@ -149,6 +160,18 @@ class Store:
 
     def set_quota_group(self, account_id: str, group_id: str) -> None:
         self.update(account_id, quota_group=group_id)
+
+    def block_model(self, account_id: str, model: str, kind: str, retry_at: float | None, code: str, failures: int):
+        with self.lock, self.db:
+            self.db.execute("INSERT OR REPLACE INTO model_blocks VALUES (?,?,?,?,?,?)",
+                            (account_id, model, kind, retry_at, code, failures))
+
+    def clear_model_blocks(self, account_id: str, model: str | None = None):
+        with self.lock, self.db:
+            if model is None:
+                self.db.execute("DELETE FROM model_blocks WHERE account_id=?", (account_id,))
+            else:
+                self.db.execute("DELETE FROM model_blocks WHERE account_id=? AND model=?", (account_id, model))
 
     def bind(self, response_id: str, account_id: str) -> None:
         with self.lock:

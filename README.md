@@ -1,6 +1,6 @@
 # Ark Plan Gateway
 
-火山方舟 Agent Plan / Coding Plan 个人版 Responses 网关。按模型选择可用密钥，在额度耗尽时切换账号；WebUI 提供账号、额度和路由管理。`POST /v1/responses` 支持同步与实时 SSE。
+火山方舟 Agent Plan / Coding Plan 个人版网关。按模型选择可用密钥，在额度耗尽时切换账号；WebUI 提供账号、额度和路由管理。`POST /v1/responses`、`POST /v1/chat/completions` 均支持同步与实时 SSE，`GET /v1/models` 提供 OpenAI 格式的模型列表。
 
 ## 启动
 
@@ -45,6 +45,22 @@ curl http://127.0.0.1:8000/v1/responses \
   -d '{"model":"ark-code-latest","input":"Reply OK","stream":false}'
 ```
 
+Chat Completions 与模型发现：
+
+```sh
+curl http://127.0.0.1:8000/v1/models \
+  -H "Authorization: Bearer $ARK_GATEWAY_SERVICE_TOKEN"
+
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Authorization: Bearer $ARK_GATEWAY_SERVICE_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"ark-code-latest","messages":[{"role":"user","content":"Reply OK"}],"stream":false}'
+```
+
+OpenAI 兼容客户端的 Base URL 填 `http://127.0.0.1:8000/v1`，使用下游访问令牌。模型列表只返回已启用、未过期且鉴权有效账号配置的模型（去重后包含路由别名）；暂时冷却的模型仍保留，调用时返回等待信息。列表不会自动发现上游所有模型，需先在账号配置中添加模型。
+
+两种生成接口均以 `stream: true` 请求对应套餐上游，适配部分上游要求 `stream must set to be true` 的情况。客户端省略 `stream` 或设为 `false` 时，网关收集流并返回原协议的完整 JSON；设为 `true` 时实时转发 SSE。Chat Completions 额外请求 `stream_options.include_usage: true`，将 `prompt_tokens` / `completion_tokens` 纳入统计与计价，支持汇总工具调用参数与 `reasoning_content`。不做 Chat 与 Responses 之间的协议转换。中途断流不会切换账号重放；非流式请求返回 502，流式请求发送错误事件。Chat 多轮上下文由客户端在 `messages` 中传入，Responses 的 `previous_response_id` 仍绑定原账号。
+
 下游等待以 `error.metadata.retry_after_seconds` 为准；字段缺失时 `plan_quota_exhausted` 表示重置时间未知，不进行自动循环调用：
 
 ```python
@@ -65,6 +81,26 @@ if response.status_code == 429:
 Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsage`；多限制窗口任一耗尽即冷却，恢复时间取已耗尽窗口最晚重置时间。Coding Plan 配置 AK/SK 后请求[官方 Ark CLI 所用的 `GetCodingPlanUsage`](https://github.com/volcengine/ark-cli/blob/main/skills/arkcli-usage/references/arkcli-usage-plan.md)，展示各窗口官方已用百分比和重置时间。推理 API Key 不能直接查询该管理接口；未配置 AK/SK 时额度显示“未知”，仍根据请求中观察到的套餐耗尽错误切换账号。普通 RPM/TPM 限流独立短退避。无可信重置时间时返回 `plan_quota_exhausted`；有可信时间时返回 `plan_pool_cooling_down` 和 `Retry-After`。
 
 同一套餐下属于同一额度主体的多个密钥可在账号编辑页指定同一个额度主体。不同套餐的同名模型可互为候选；需要别名时，在账号编辑页按 `别名=上游模型` 配置模型映射。`previous_response_id` 始终回到创建它的账号。密钥、提示词、完整上游错误不写入日志；数据库、`.env` 和静态构建物不进入 Git。请备份 `.env` 中的主密钥，否则数据库中的账号密钥无法解密。
+
+## 上游错误与恢复
+
+错误策略按[方舟错误码文档](https://docs.volcengine.com/docs/ark/error-codes?lang=zh)区分影响范围：
+
+| 情况 | 处理 |
+| --- | --- |
+| 账号/API 限流、并发超限、无法识别的 429 | 对额度主体短暂退避，切换其他账号，不标记套餐耗尽 |
+| 模型/接入点 RPM、TPM、IPM | 只对该额度主体的相应上游模型退避，路由别名共享状态 |
+| `ServerOverloaded`、`RequestBurstTooFast` | 同套餐、同上游模型短暂退避，避免连续轮换密钥冲击同一服务；明确 429 拒绝时可尝试另一套餐 |
+| 已识别套餐额度耗尽 | 保留已知/未知重置时间和原有冷却返回契约 |
+| 模型未开通、不支持、设置的模型限额/免费试用耗尽 | 持久化隔离该账号对应模型，其他模型仍可用；修改路由或手动恢复后重新尝试 |
+| API Key 无效 | 标记该密钥鉴权失败并切换；更新密钥或手动恢复后再试 |
+| 欠费、账号状态异常 | 暂停对应额度主体，等待管理员处理后手动恢复 |
+| 工具/MCP 凭据、资源权限、参数、内容、文件/Session 等请求错误 | 返回错误，不停用整把推理密钥，不自动换账号 |
+| 5xx、发送结果不明、已开始生成后失败 | 当前请求不重放；服务/传输故障对该账号模型短暂退避 |
+
+默认退避按连续失败次数在 10、20、40…300 秒窗口内取 50%–100% 随机延迟；上游有效 `Retry-After` 是最短等待下限，不截短。冷却结束后只允许一个并发请求试探，完整成功才恢复；较早的成功请求不能清除新发生的失败状态。模型隔离、失败次数和冷却会跨重启保留。账号详情展示原因码及恢复时间，手动恢复清除同一额度主体的冷却、模型隔离和鉴权失败状态。
+
+下游错误 `metadata` 可包含 `upstream_status`、白名单 `upstream_code`、`category`、`blocking_codes`、`retryable`、`requires_admin`，并保留原有等待字段。不会回传或持久化完整上游错误消息；未知错误码显示为 `UnknownUpstreamError`。`retryable: false` 表示网关不能保证重放安全或需要修改请求，不应据此无限重试。
 
 ## AK/SK 与统计
 

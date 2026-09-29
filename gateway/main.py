@@ -15,12 +15,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+import anyio
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
+from .protocols import ProtocolError, SSEDecoder, StreamResult
+from .errors import safe_error_code
 from .store import Store
 
 AGENT_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
@@ -38,8 +41,9 @@ def password_ok(password: str, hashed: str) -> bool:
     return hmac.compare_digest(password_hash(password, salt), hashed)
 
 
-def error_response(status: int, code: str, retry_at: float | None = None, exact: bool = False) -> JSONResponse:
-    metadata = {"reset_time_known": retry_at is not None, "exact_pool_minimum": exact}
+def error_response(status: int, code: str, retry_at: float | None = None, exact: bool = False,
+                   details: dict | None = None) -> JSONResponse:
+    metadata = {**(details or {}), "reset_time_known": retry_at is not None, "exact_pool_minimum": exact}
     headers = {}
     message = code
     if retry_at is not None:
@@ -51,14 +55,14 @@ def error_response(status: int, code: str, retry_at: float | None = None, exact:
                                    "metadata": metadata}}, status_code=status, headers=headers)
 
 
-def token_usage(response: object) -> tuple[int, int]:
+def token_usage(response: object, chat: bool = False) -> tuple[int, int]:
     usage = response.get("usage") if isinstance(response, dict) else None
     if not isinstance(usage, dict):
         return 0, 0
     def count(name: str) -> int:
         value = usage.get(name)
         return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
-    return count("input_tokens"), count("output_tokens")
+    return count("prompt_tokens" if chat else "input_tokens"), count("completion_tokens" if chat else "output_tokens")
 
 
 class AccountIn(BaseModel):
@@ -261,7 +265,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     @app.patch("/api/accounts/{account_id}")
     async def edit_account(account_id: str, body: AccountPatch, request: Request):
         require_admin(request, True)
-        if not store.account(account_id):
+        previous = store.account(account_id)
+        if not previous:
             raise HTTPException(404, "account not found")
         data = body.model_dump(exclude_unset=True)
         if "quota_group" in data:
@@ -276,6 +281,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             store.update(account_id, **data)
         except sqlite3.IntegrityError:
             raise HTTPException(409, "API key already exists")
+        if data.get("api_key") or any(k in data and data[k] != previous[k] for k in ("models", "model_mapping")):
+            store.clear_model_blocks(account_id)
+        if data.get("api_key"):
+            store.update(account_id, auth_failed=0)
         return store.account(account_id)
 
     @app.post("/api/accounts/{account_id}/refresh")
@@ -296,7 +305,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             raise HTTPException(404, "account not found")
         for a in store.accounts():
             if a["quota_group"] == account["quota_group"]:
-                store.update(a["id"], cooldown_kind=None, cooldown_until=None, auth_failed=0)
+                store.update(a["id"], cooldown_kind=None, cooldown_until=None, cooldown_failures=0, cooldown_code=None, auth_failed=0)
+                store.clear_model_blocks(a["id"])
         return store.account(account_id)
 
     @app.get("/api/settings")
@@ -353,126 +363,202 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     @app.get("/v1/models")
     async def models(request: Request):
         require_service(request)
-        names = sorted({m for a in store.accounts() if a["enabled"] and not a["auth_failed"] for m in a["models"]})
-        return {"object": "list", "data": [{"id": m, "object": "model", "owned_by": "ark-plan-gateway"} for m in names]}
+        names = sorted({m for a in store.accounts() if a["enabled"] and not a["auth_failed"] and not a["expired"] and a["cooldown_kind"] != "account"
+                        for m in a["models"] if not (pool.model_block(a, m) and pool.model_block(a, m)["retry_at"] is None)})
+        return {"object": "list", "data": [{"id": m, "object": "model", "created": 0, "owned_by": "ark-plan-gateway"} for m in names]}
 
     async def proxy(request: Request, method: str, path: str, body: bytes | None, model: str,
                     pinned: str | None, stream: bool = False):
+        chat = path == "/chat/completions"
         attempted: set[str] = set()
+        last_error: dict = {}
         while True:
             candidates = await pool.candidates(model, pinned, attempted)
             if not candidates:
                 status, code, retry_at, exact = pool.unavailable(model, pinned)
-                return error_response(status, code, retry_at, exact)
+                reasons = set()
+                for a in store.accounts():
+                    if model not in a["models"] or (pinned and a["id"] != pinned):
+                        continue
+                    if a["cooldown_code"]:
+                        reasons.add(a["cooldown_code"])
+                    block = pool.model_block(a, model)
+                    if block:
+                        reasons.add(block["code"])
+                return error_response(status, code, retry_at, exact,
+                                      {**last_error, "blocking_codes": sorted(reasons), "retryable": retry_at is not None,
+                                       "requires_admin": retry_at is None})
             account = candidates[0]
             attempted.add(account["id"])
-            if not await pool.reserve(account):
+            if not await pool.reserve(account, model):
                 continue
             started = time.monotonic()
             started_at = time.time()
             def record(outcome: str, response_data: object = None):
                 if method == "POST":
-                    inputs, outputs = token_usage(response_data)
+                    inputs, outputs = token_usage(response_data, chat)
                     usage = response_data.get("usage") if isinstance(response_data, dict) else None
-                    context = usage.get("input_tokens") if isinstance(usage, dict) else None
+                    context = usage.get("prompt_tokens" if chat else "input_tokens") if isinstance(usage, dict) else None
                     context = context if isinstance(context, int) and not isinstance(context, bool) and context >= 0 else -1
                     reported_model = response_data.get("model") if isinstance(response_data, dict) else None
                     usage_model = reported_model if isinstance(reported_model, str) and 0 < len(reported_model) <= 128 else account["model_mapping"].get(model, model)
                     store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), usage_model, inputs, outputs, started_at, context)
+                if outcome == "success":
+                    pool.update_result(account, "ok", None, model)
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
             headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json"}
-            if stream:
+            if method == "POST":
                 headers["Accept"] = "text/event-stream"
             try:
                 account_body = body
                 mapped = account["model_mapping"].get(model)
-                if method == "POST" and mapped and mapped != model:
+                if method == "POST":
                     account_json = json.loads(body)
-                    account_json["model"] = mapped
+                    if mapped:
+                        account_json["model"] = mapped
+                    # Plan/model variants may require streaming. Request it on the
+                    # first attempt; never replay an accepted generation to adapt.
+                    account_json["stream"] = True
+                    if chat:
+                        account_json["stream_options"] = {**account_json.get("stream_options", {}), "include_usage": True}
                     account_body = json.dumps(account_json, ensure_ascii=False).encode()
                 req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
             except (httpx.TimeoutException, httpx.TransportError):
                 record("transport_error")
+                if method == "POST":
+                    pool.update_result(account, "server", None, model)
                 await pool.release(account)
-                return error_response(502, "upstream_transport_ambiguous")
+                return error_response(502, "upstream_transport_ambiguous", details={"category": "transport", "retryable": False})
+            except asyncio.CancelledError:
+                record("client_disconnected")
+                with anyio.CancelScope(shield=True):
+                    await pool.release(account)
+                raise
+
+            async def close_upstream():
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await upstream.aclose()
+                    finally:
+                        await pool.release(account)
             if upstream.status_code >= 400:
                 try:
                     raw = await upstream.aread()
                 except (httpx.TimeoutException, httpx.TransportError):
                     record("response_error")
-                    await upstream.aclose()
-                    await pool.release(account)
+                    if method == "POST":
+                        pool.update_result(account, "server", None, model)
+                    await close_upstream()
                     return error_response(502, "upstream_response_failed")
+                except asyncio.CancelledError:
+                    record("client_disconnected")
+                    await close_upstream()
+                    raise
                 kind, until = classify_error(upstream.status_code, raw, upstream.headers, time.time())
-                record(kind if kind != "other" else "rejected")
-                pool.update_result(account, kind, until)
-                await upstream.aclose()
-                await pool.release(account)
-                if kind in ("quota", "rate", "auth"):
+                code = safe_error_code(raw)
+                last_error = {"upstream_status": upstream.status_code, "upstream_code": code, "category": kind}
+                record(kind)
+                # A lookup/deletion error must not quarantine a working model.
+                if method == "POST" or kind in ("quota", "rate", "auth", "account"):
+                    pool.update_result(account, kind, until, model, code)
+                await close_upstream()
+                if kind in ("quota", "rate", "model_rate", "auth", "account", "model", "model_limit", "overload") and method == "POST" and upstream.status_code < 500:
                     continue
-                return error_response(upstream.status_code if upstream.status_code < 500 else 502, "upstream_rejected")
-            pool.update_result(account, "ok", None)
-            if not stream:
+                gateway_code = {"permission": "upstream_permission_denied", "request": "upstream_request_rejected",
+                                "server": "upstream_server_error"}.get(kind, "upstream_rejected")
+                if upstream.status_code >= 500:
+                    gateway_code = "upstream_server_error"
+                return error_response(upstream.status_code if upstream.status_code < 500 else 502, gateway_code,
+                                      details={**last_error, "retryable": False})
+            upstream_sse = upstream.headers.get("content-type", "").split(";", 1)[0].strip() == "text/event-stream"
+            if not upstream_sse:
                 try:
+                    if stream:
+                        record("response_error")
+                        return error_response(502, "upstream_stream_expected")
                     raw = await upstream.aread()
                     data = json.loads(raw)
-                    if isinstance(data, dict) and data.get("id"):
+                    if not chat and isinstance(data, dict) and data.get("id"):
                         store.bind(data["id"], account["id"])
                     record("success", data)
                     return Response(content=raw, status_code=upstream.status_code,
                                     media_type=upstream.headers.get("content-type", "application/json"))
                 except (httpx.TimeoutException, httpx.TransportError, ValueError):
                     record("response_error")
+                    if method == "POST":
+                        pool.update_result(account, "server", None, model)
                     return error_response(502, "upstream_response_failed")
                 finally:
-                    await upstream.aclose()
-                    await pool.release(account)
+                    await close_upstream()
+
+            decoder = SSEDecoder()
+            state = StreamResult(chat, collect=not stream)
+            stream_error: dict = {}
+
+            def observe(chunk: bytes):
+                for obj in decoder.feed(chunk):
+                    state.observe(obj)
+                    if obj is None:
+                        continue
+                    response_obj = obj.get("response", {})
+                    if not chat and isinstance(response_obj, dict) and response_obj.get("id"):
+                        store.bind(response_obj["id"], account["id"])
+                    if state.failed and not stream_error:
+                        error = obj.get("error")
+                        if not error and isinstance(response_obj, dict):
+                            error = response_obj.get("error")
+                        raw_error = json.dumps({"error": error}).encode()
+                        kind, until = classify_error(500, raw_error, {}, time.time())
+                        code = safe_error_code(raw_error)
+                        stream_error.update(upstream_code=code, category=kind, retryable=False)
+                        pool.update_result(account, kind, until, model, code)
+
+            if not stream:
+                outcome = "client_disconnected"
+                try:
+                    async for chunk in upstream.aiter_bytes():
+                        if await request.is_disconnected():
+                            return error_response(499, "client_disconnected")
+                        observe(chunk)
+                        if state.failed:
+                            raise ProtocolError("upstream_stream_failed")
+                    data = state.result()
+                    outcome = "success"
+                    return JSONResponse(data, status_code=upstream.status_code)
+                except (httpx.TimeoutException, httpx.TransportError, ValueError, KeyError, TypeError):
+                    outcome = "stream_error"
+                    if not state.failed:
+                        pool.update_result(account, "server", None, model)
+                    return error_response(502, "upstream_stream_incomplete", details={"retryable": False, **stream_error})
+                finally:
+                    record(outcome, state.usage_response)
+                    await close_upstream()
 
             async def events():
-                buffer = b""
                 outcome = "client_disconnected"
-                latest_response = None
                 try:
-                    async for chunk in upstream.aiter_raw():
-                        buffer += chunk
-                        if len(buffer) > 2_000_000:
-                            buffer = buffer[-1_000_000:]
-                        for line in buffer.split(b"\n")[:-1]:
-                            if line.startswith(b"data:"):
-                                try:
-                                    obj = json.loads(line[5:])
-                                    response_obj = obj.get("response", {})
-                                    if isinstance(response_obj, dict) and response_obj.get("usage"):
-                                        latest_response = response_obj
-                                    response_id = response_obj.get("id") or obj.get("id")
-                                    if response_id and str(response_id).startswith("resp_"):
-                                        store.bind(response_id, account["id"])
-                                    if isinstance(obj.get("error"), dict):
-                                        kind, until = classify_error(429, json.dumps(obj).encode(), {}, time.time())
-                                        outcome = kind if kind != "other" else "stream_error"
-                                        if kind == "quota":
-                                            pool.update_result(account, kind, until)
-                                except (ValueError, TypeError, AttributeError):
-                                    pass
-                        buffer = buffer.rsplit(b"\n", 1)[-1]
+                    async for chunk in upstream.aiter_bytes():
+                        observe(chunk)
                         yield chunk
-                    if outcome == "client_disconnected":
-                        outcome = "success"
-                except (httpx.TimeoutException, httpx.TransportError):
+                    outcome = "stream_error" if state.failed or not state.done else "success"
+                    if not state.failed and not state.done:
+                        pool.update_result(account, "server", None, model)
+                        yield b'\ndata: {"error":{"code":"upstream_stream_incomplete"}}\n\n'
+                except (httpx.TimeoutException, httpx.TransportError, ValueError, KeyError, TypeError):
                     outcome = "stream_error"
+                    if not state.failed:
+                        pool.update_result(account, "server", None, model)
                     yield b"\nevent: error\ndata: {\"error\":{\"code\":\"upstream_stream_interrupted\"}}\n\n"
                 finally:
-                    record(outcome, latest_response)
-                    await upstream.aclose()
-                    await pool.release(account)
+                    record(outcome, state.usage_response)
+                    await close_upstream()
 
             return StreamingResponse(events(), status_code=upstream.status_code, media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    @app.post("/v1/responses")
-    async def responses(request: Request):
+    async def create_generation(request: Request, chat: bool):
         require_service(request)
         raw = await request.body()
         if len(raw) > 8_000_000:
@@ -484,13 +570,31 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         model = data.get("model") if isinstance(data, dict) else None
         if not isinstance(model, str) or not model:
             return error_response(400, "model_required")
+        if "stream" in data and not isinstance(data["stream"], bool):
+            return error_response(400, "stream_must_be_boolean")
+        if chat:
+            if not isinstance(data.get("messages"), list) or not data["messages"]:
+                return error_response(400, "messages_required")
+            if "stream_options" in data and not isinstance(data["stream_options"], dict):
+                return error_response(400, "invalid_stream_options")
+            return await proxy(request, "POST", "/chat/completions", raw, model, None, data.get("stream", False))
         if data.get("background"):
             return error_response(400, "background_not_supported")
         prior = data.get("previous_response_id")
+        if prior is not None and not isinstance(prior, str):
+            return error_response(400, "invalid_previous_response_id")
         pinned = store.lookup_binding(prior) if prior else None
         if prior and not pinned:
             return error_response(404, "previous_response_unknown")
         return await proxy(request, "POST", "/responses", raw, model, pinned, bool(data.get("stream")))
+
+    @app.post("/v1/responses")
+    async def responses(request: Request):
+        return await create_generation(request, chat=False)
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(request: Request):
+        return await create_generation(request, chat=True)
 
     @app.api_route("/v1/responses/{response_id}", methods=["GET", "DELETE"])
     async def response_item(response_id: str, request: Request):

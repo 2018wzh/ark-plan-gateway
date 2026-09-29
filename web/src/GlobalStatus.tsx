@@ -1,13 +1,13 @@
 import {Badge, Card, Space, Tag, Typography} from 'antd';
-import {Account, accountStatus} from './accounts';
+import {Account, accountStatus, usableModels} from './accounts';
 import {poolCooldown,formatWait} from './cooldown';
 
 export default function GlobalStatus({accounts,now}:{accounts:Account[],now:number}){
   const active=accounts.filter(a=>accountStatus(a,now).key==='active');
   const enabled=accounts.filter(a=>!!a.enabled);
   const models=new Set(enabled.flatMap(a=>a.models));
-  const available=new Set(active.flatMap(a=>a.models));
-  const fullyAvailable=enabled.length>0&&active.length===enabled.length;
+  const available=new Set(active.flatMap(a=>usableModels(a,now)));
+  const fullyAvailable=enabled.length>0&&active.length===enabled.length&&active.every(a=>usableModels(a,now).length===a.models.length);
   const label=!accounts.length?'尚未配置':!enabled.length?'全部停用':!active.length?'暂无可用账号':fullyAvailable?'运行正常':'部分账号不可用';
   const color=!enabled.length?'#91a0a6':!active.length?'#c94343':fullyAvailable?'#16a085':'#c28a26';
   const quotaGroups=new Set(accounts.map(a=>a.quota_group));
