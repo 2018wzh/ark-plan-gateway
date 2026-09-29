@@ -48,11 +48,11 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
           {title:'支持模型',width:180,render:(_,a)=><div className="model-list">{a.models.map(model=><span key={model}>{model}</span>)}</div>},
           {title:'可用额度',width:340,render:(_,a)=>Object.keys(a.usage).length?<div className="quota-rows">{Object.entries(a.usage).map(([name,usage])=>{
             const value=remaining(usage);
-            const used=a.plan==='coding'?`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})}% 已用`:`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})} / ${usage.quota.toLocaleString()} AFP`;
+            const used=a.plan==='coding'?`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:4})}% 已用`:`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:4})} / ${usage.quota.toLocaleString()} AFP`;
             return <div className="quota-row" key={name}>
-              <Progress type="circle" size={40} strokeWidth={8} aria-label={`${a.label} ${windowName(name)}剩余额度`} percent={value??0} format={()=>value===null?'未知':`${value.toFixed(1)}%`} strokeColor={value===null?'#91a0a6':quotaColor(value)}/>
+              <Progress type="circle" size={40} strokeWidth={8} aria-label={`${a.label} ${windowName(name)}剩余额度`} percent={value??0} format={()=>value===null?'未知':`${value===0||value===100?value:value.toFixed(3)}%`} strokeColor={value===null?'#91a0a6':quotaColor(value)}/>
               <div className="quota-row-body"><div className="quota-row-heading"><span>{windowName(name)}</span></div>
-              <div className="quota-row-meta"><Tooltip title={used}><span>{used}</span></Tooltip><Tooltip title={formatTime(usage.reset_time)}><span>{usage.reset_time&&usage.reset_time>0?`${new Date(usage.reset_time*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})} 重置`:'重置时间未知'}</span></Tooltip></div></div>
+              <div className="quota-row-meta"><Tooltip title={used}><span>{used}</span></Tooltip><Tooltip title={formatTime(usage.reset_time)}><span>{usage.reset_time&&usage.reset_time>0?`${new Date(usage.reset_time*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})} 重置`:'重置时间未知'}</span></Tooltip></div></div>
             </div>;
           })}{a.quota_error&&<Typography.Text type="warning">查询失败，显示上次额度</Typography.Text>}</div>:<Typography.Text type="secondary">未知{!a.has_ak_sk?' · 未配置 AK/SK':''}</Typography.Text>},
           {title:'状态',width:115,render:(_,a)=><div className="account-state"><StatusBadge account={a}/>{accountStatus(a,now).key==='cooling'&&<small>{effectiveCooldown(a,now)?.until?`剩余 ${formatWait(effectiveCooldown(a,now)!.until!,now)}`:'恢复时间未知'}</small>}</div>},

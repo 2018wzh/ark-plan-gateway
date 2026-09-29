@@ -34,6 +34,23 @@ def parse_coding_usage(result: dict) -> dict:
     return usage
 
 
+def quota_cooldown_state(member: dict, usage: dict, now: float, code: str) -> dict:
+    """A refresh may extend a hold, but cannot cancel a future reset."""
+    if member["cooldown_kind"] == "account":
+        return {}
+    exhausted = exhausted_windows(usage)
+    known_hold = member["cooldown_kind"] == "quota" and member["cooldown_until"] is not None and member["cooldown_until"] > now
+    if exhausted:
+        resets = [window.get("reset_time") for window in exhausted]
+        until = max(resets) if all(value and math.isfinite(value) and value > now for value in resets) else None
+        if known_hold and until is not None:
+            until = max(until, member["cooldown_until"])
+        return {"cooldown_kind": "quota", "cooldown_until": until, "cooldown_code": code, "cooldown_failures": 0}
+    if member["cooldown_kind"] == "quota" and not known_hold:
+        return {"cooldown_kind": None, "cooldown_until": None, "cooldown_code": None, "cooldown_failures": 0}
+    return {}
+
+
 async def management_call(action: str, ak: str, sk: str, body: dict) -> dict:
     query = {"Action": action, "Version": "2024-01-01", "Region": "cn-beijing"}
     text = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
@@ -70,36 +87,35 @@ async def refresh_account(store: Store, account: dict) -> None:
                 if not isinstance(item, dict) or "Quota" not in item:
                     continue
                 usage[key] = {"quota": float(item["Quota"]), "used": float(item["Used"]),
-                              "reset_time": int(item["ResetTime"]) / 1000, "unit": "afp"}
+                              "reset_time": float(item["ResetTime"]) / 1000 if item.get("ResetTime") else None, "unit": "afp"}
             if not usage:
                 raise RuntimeError("empty AFP usage")
-            store.record_quota(account["quota_group"], "agent", usage, now)
-            exhausted = exhausted_windows(usage)
-            until = max((x["reset_time"] for x in exhausted), default=None) if all(x.get("reset_time") for x in exhausted) else None
+            # Partial snapshots must not forget a previously exhausted window.
+            current = store.account(account["id"])
+            for key, window in current.get("usage", {}).items():
+                if key not in usage and exhausted_windows({key: window}):
+                    usage[key] = window
             for member in store.accounts():
                 if member["quota_group"] == account["quota_group"] and member["plan"] == "agent":
                     state = {"usage_json": json.dumps(usage), "quota_checked_at": now, "quota_error": None}
-                    if (exhausted and member["cooldown_kind"] != "account") or member["cooldown_kind"] == "quota":
-                        state.update(cooldown_kind="quota" if exhausted else None, cooldown_until=until,
-                                     cooldown_code="QuotaExceeded.AgentPlanQuotaExceeded" if exhausted else None,
-                                     cooldown_failures=0)
+                    state.update(quota_cooldown_state(member, usage, now, "QuotaExceeded.AgentPlanQuotaExceeded"))
                     store.update(member["id"], **state)
         else:
             result = await management_call("GetCodingPlanUsage", account["access_key"], account["secret_key"], {})
             usage = parse_coding_usage(result)
             if not usage:
                 raise RuntimeError("empty Coding Plan usage")
-            store.record_quota(account["quota_group"], "coding", usage, now)
-            exhausted = exhausted_windows(usage)
-            until = max((x["reset_time"] for x in exhausted), default=None) if all(x.get("reset_time") for x in exhausted) else None
+            # Partial snapshots must not forget a previously exhausted window.
+            current = store.account(account["id"])
+            for key, window in current.get("usage", {}).items():
+                if key not in usage and exhausted_windows({key: window}):
+                    usage[key] = window
             expired = result.get("Status") not in (None, "Running")
             for member in store.accounts():
                 if member["quota_group"] == account["quota_group"] and member["plan"] == "coding":
                     state = {"usage_json": json.dumps(usage), "expired": int(expired),
                              "quota_checked_at": now, "quota_error": None}
-                    if (exhausted and member["cooldown_kind"] != "account") or member["cooldown_kind"] == "quota":
-                        state.update(cooldown_kind="quota" if exhausted else None, cooldown_until=until,
-                                     cooldown_code="QuotaExceeded" if exhausted else None, cooldown_failures=0)
+                    state.update(quota_cooldown_state(member, usage, now, "QuotaExceeded"))
                     store.update(member["id"], **state)
     except Exception as exc:
         store.update(account["id"], quota_error=f"查询失败：{type(exc).__name__}")

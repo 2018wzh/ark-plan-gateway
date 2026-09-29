@@ -14,7 +14,7 @@ import './style.css';
 const Statistics=lazy(()=>import('./Statistics'));
 const pages=[
   {key:'accounts',label:'账号与额度',description:'管理套餐密钥、可用额度与账号状态',icon:<TeamOutlined/>},
-  {key:'statistics',label:'额度与统计',description:'按模型查看 Token 消耗与等效价格',icon:<BarChartOutlined/>},
+  {key:'statistics',label:'消耗统计',description:'按模型查看 Token 消耗与等效价格',icon:<BarChartOutlined/>},
   {key:'pricing',label:'模型定价',description:'配置默认单价与各模型的专属价格',icon:<DollarOutlined/>},
   {key:'routes',label:'路由状态',description:'查看模型映射、账号状态与当前并发',icon:<ApiOutlined/>},
   {key:'settings',label:'服务设置',description:'管理额度刷新与访问凭据',icon:<SettingOutlined/>},

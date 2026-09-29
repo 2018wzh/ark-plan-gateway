@@ -232,3 +232,86 @@ async def test_quota_refresh_does_not_remove_account_hold(store, monkeypatch):
     monkeypatch.setattr(quota, 'management_call', usage)
     await quota.refresh_account(store, store.account(aid, True))
     assert store.account(aid)['cooldown_kind'] == 'account'
+
+
+@pytest.mark.parametrize('message', ['daily quota exceeded', 'per-day quota exhausted', '每日额度耗尽'])
+def test_daily_quota_classification(message):
+    assert classify_error(429, error('QuotaExceeded', message), {'retry-after': '3600'}, 1000) == ('quota', 4600)
+    assert classify_error(429, error('QuotaExceeded', message), {}, 1000) == ('quota', None)
+    assert classify_error(429, error('QuotaExceeded', 'daily free trial quota exceeded'), {}, 1000)[0] == 'model_limit'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('plan', ['agent', 'coding'])
+async def test_refresh_preserves_future_quota_hold_and_partial_windows(store, monkeypatch, plan):
+    from gateway import quota
+    now = time.time()
+    aid = store.add_account(plan, 'a', models=['m'])
+    window = 'AFPDaily' if plan == 'agent' else 'weekly'
+    store.update(aid, access_key='ak', secret_key='sk', cooldown_kind='quota', cooldown_until=now+3600)
+    result = ({'AFPDaily': {'Quota': 100, 'Used': 99, 'ResetTime': int((now+3600)*1000)}} if plan == 'agent'
+              else {'QuotaUsage': [{'Level': 'weekly', 'Percent': 99, 'ResetTimestamp': now+3600}]})
+    async def usage(*args):
+        return result
+    monkeypatch.setattr(quota, 'management_call', usage)
+    await quota.refresh_account(store, store.account(aid, True))
+    assert store.account(aid)['cooldown_until'] == now+3600
+    store.update(aid, cooldown_until=now-1)
+    await quota.refresh_account(store, store.account(aid, True))
+    assert store.account(aid)['cooldown_kind'] is None
+    store.update(aid, usage_json=json.dumps({window: {'quota': 100, 'used': 100, 'reset_time': now+7200}}))
+    result = ({'AFPFiveHour': {'Quota': 100, 'Used': 1, 'ResetTime': int((now+3600)*1000)}} if plan == 'agent'
+              else {'QuotaUsage': [{'Level': 'session', 'Percent': 1, 'ResetTimestamp': now+3600}]})
+    for _ in range(2):
+        await quota.refresh_account(store, store.account(aid, True))
+        assert store.account(aid)['cooldown_kind'] == 'quota'
+        assert store.account(aid)['cooldown_until'] == now+7200
+        assert store.account(aid)['usage'][window]['used'] == 100
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('path', ['/v1/responses', '/v1/chat/completions'])
+@pytest.mark.parametrize('known', [True, False])
+async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, monkeypatch, path, known):
+    monkeypatch.setenv('ARK_GATEWAY_ALLOW_UNCONFIGURED', '1')
+    monkeypatch.setenv('ARK_GATEWAY_ADMIN_PASSWORD', 'test-password-123')
+    monkeypatch.setenv('ARK_GATEWAY_SERVICE_TOKEN', 'service-token-123456789012345')
+    from gateway.main import create_app
+    for plan in ('agent', 'coding'):
+        store.add_account(plan, plan, models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(429, content=error('QuotaExceeded', 'daily quota exhausted'),
+                              headers={'retry-after': str(3600 if len(calls) == 1 else 7200)} if known else {})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            for _ in range(2):
+                response = await client.post(path, headers={'authorization': 'Bearer service-token-123456789012345'},
+                                             json={'model': 'm', 'input': 'test', 'messages': [{'role': 'user', 'content': 'test'}]})
+                assert response.status_code == 429
+                assert response.json()['error']['code'] == ('plan_pool_cooling_down' if known else 'plan_quota_exhausted')
+                if known:
+                    assert 3598 <= int(response.headers['retry-after']) <= 3600
+                    assert response.json()['error']['metadata']['reset_time_known'] is True
+                else:
+                    assert 'retry-after' not in response.headers
+    assert len(calls) == 2
+    assert all(a['cooldown_kind'] == 'quota' for a in store.accounts())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('reset', [None, 0, -1])
+async def test_exhausted_daily_without_valid_reset_never_probes(store, monkeypatch, reset):
+    from gateway import quota
+    aid = store.add_account('agent', 'a', models=['m'])
+    store.update(aid, access_key='ak', secret_key='sk')
+    async def usage(*args):
+        return {'AFPDaily': {'Quota': 100, 'Used': 100, 'ResetTime': reset}}
+    monkeypatch.setattr(quota, 'management_call', usage)
+    await quota.refresh_account(store, store.account(aid, True))
+    account = store.account(aid)
+    assert account['quota_error'] is None
+    assert account['cooldown_kind'] == 'quota' and account['cooldown_until'] is None
+    assert not await AccountPool(store).candidates('m')

@@ -23,7 +23,7 @@ def test_import_deduplicates_and_encrypts(store):
     assert "secret-value" not in (store.db.execute("SELECT api_key FROM accounts").fetchone()[0])
 
 
-def test_statistics_are_persistent_and_shared_quota_is_not_double_counted(tmp_path):
+def test_statistics_are_persistent_and_only_include_consumption(tmp_path):
     key = Fernet.generate_key().decode()
     path = str(tmp_path / "statistics.db")
     store = Store(path, key)
@@ -33,14 +33,12 @@ def test_statistics_are_persistent_and_shared_quota_is_not_double_counted(tmp_pa
     usage = {"five_hour": {"quota": 100, "used": 35, "reset_time": time.time() + 3600}}
     for account_id in (first, second):
         store.update(account_id, usage_json=json.dumps(usage), quota_checked_at=time.time())
-    store.record_quota(first, "agent", usage, time.time())
     store.record_request(first, "success", 1200, "m", 12, 3)
     store.record_request(second, "rate", 80)
     store.close()
     store = Store(path, key)
     all_stats = store.statistics(None, 7)
-    assert len(all_stats["quota_current"]) == 1
-    assert len(all_stats["quota_history"]) == 1
+    assert set(all_stats) == {"daily", "model_daily", "hourly", "model_hourly", "hourly_started_at"}
     assert sum(row["requests"] for row in all_stats["daily"]) == 2
     assert sum(row["input_tokens"] for row in all_stats["daily"]) == 12
     assert sum(row["requests"] for row in store.statistics(first, 7)["daily"]) == 1
@@ -174,7 +172,7 @@ async def test_afp_uses_latest_exhausted_window_reset(store, monkeypatch):
     result = store.account(a)
     assert result["cooldown_kind"] == "quota"
     assert 80 < result["cooldown_until"]-now < 100
-    assert len(store.statistics(a, 1)["quota_history"]) == 3
+    assert len(result["usage"]) == 3
 
 
 @pytest.mark.asyncio
@@ -198,7 +196,7 @@ async def test_coding_usage_percent_and_shared_cooldown(store, monkeypatch):
         assert row["cooldown_kind"] == "quota"
         assert 80 < row["cooldown_until"]-now < 100
         assert row["usage"]["monthly"]["unit"] == "percent"
-    assert len(store.statistics(None, 1)["quota_current"]) == 3
+    assert store.account(first)["usage"] == store.account(second)["usage"]
 
 
 def test_coding_usage_rejects_invalid_percent():
@@ -299,3 +297,37 @@ async def test_account_editor_credentials_and_duplicate_keys(store, monkeypatch)
             assert (await client.patch(f"/api/accounts/{second}", json={"label":"changed", "api_key":body["api_key"]})).status_code == 409
             assert store.account(second)["label"] == "second"
             assert (await client.patch(f"/api/accounts/{second}", json={"label":"updated"})).status_code == 200
+
+
+def test_hourly_statistics_boundaries_prices_filter_and_restart(tmp_path, monkeypatch):
+    path = str(tmp_path / "hourly.db")
+    key = Fernet.generate_key().decode()
+    store = Store(path, key)
+    first = store.add_account("agent", "first", models=["m"])
+    second = store.add_account("coding", "second", models=["m"])
+    now = int(time.time() // 86400) * 86400 + 12 * 3600
+    store.set_pricing({"default": {"input": 2, "output": 4}, "models": {}})
+    for stamp, aid, tokens in [(now-1, first, 10), (now, first, 20), (now+1, second, 30)]:
+        monkeypatch.setattr("gateway.store.time.time", lambda: stamp)
+        store.record_request(aid, "success", 1, "m", tokens, tokens)
+    rows = store.statistics(None, 1)["model_hourly"]
+    assert len(rows) == 2
+    assert sorted(r["input_tokens"] for r in rows) == [10, 50]
+    assert sum(r["equivalent_cny"] for r in rows) == pytest.approx(.00036)
+    assert sum(r["input_tokens"] for r in store.statistics(first, 1)["model_hourly"]) == 30
+    assert sum(r["requests"] for r in store.statistics(None, 1)["hourly"]) == 3
+    started = store.statistics(None, 1)["hourly_started_at"]
+    store.close()
+    store = Store(path, key)
+    assert store.statistics(None, 1)["hourly_started_at"] == started
+    assert len(store.statistics(None, 1)["model_hourly"]) == 2
+    store.close()
+
+
+def test_daily_history_is_not_invented_as_hourly_usage(store):
+    aid = store.add_account("agent", "a", models=["m"])
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    store.db.execute("INSERT INTO request_daily VALUES (?,?,?,?,?,?,?,?,?,?)", (today, aid, "m", "success", 10, -1, 1, 10, 1, 10))
+    store.db.commit()
+    assert store.statistics(None, 1)["model_daily"][0]["input_tokens"] == 10
+    assert store.statistics(None, 1)["model_hourly"] == []

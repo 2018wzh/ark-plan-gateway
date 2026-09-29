@@ -43,13 +43,6 @@ class Store:
           retry_at REAL, code TEXT NOT NULL, failures INTEGER NOT NULL,
           PRIMARY KEY (account_id, model)
         );
-        CREATE TABLE IF NOT EXISTS quota_snapshots (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          observed_at REAL NOT NULL, quota_group TEXT NOT NULL, plan TEXT NOT NULL,
-          window TEXT NOT NULL, quota REAL NOT NULL, used REAL NOT NULL, reset_time REAL
-        );
-        CREATE INDEX IF NOT EXISTS quota_snapshots_scope_time
-          ON quota_snapshots (quota_group, window, observed_at DESC);
         CREATE TABLE IF NOT EXISTS request_daily (
           day TEXT NOT NULL, account_id TEXT NOT NULL, outcome TEXT NOT NULL,
           requests INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -79,6 +72,14 @@ class Store:
             DROP TABLE request_daily;
             ALTER TABLE request_daily_new RENAME TO request_daily;
             """)
+        self.db.execute("""CREATE TABLE IF NOT EXISTS request_hourly (
+            hour TEXT NOT NULL, account_id TEXT NOT NULL, model TEXT NOT NULL,
+            outcome TEXT NOT NULL, context_tokens INTEGER NOT NULL, price_period INTEGER NOT NULL,
+            requests INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (hour, account_id, model, outcome, context_tokens, price_period)
+        )""")
+        self.db.execute("INSERT OR IGNORE INTO settings VALUES ('hourly_started_at', ?)", (str(time.time()),))
         self._last_pruned_day = ""
         self._prune_locked(time.time())
         self.db.commit()
@@ -87,8 +88,9 @@ class Store:
         today = time.strftime("%Y-%m-%d", time.gmtime(now))
         if today == self._last_pruned_day:
             return
-        self.db.execute("DELETE FROM quota_snapshots WHERE observed_at < ?", (now - 90 * 86400,))
         self.db.execute("DELETE FROM request_daily WHERE day < ?",
+                        (time.strftime("%Y-%m-%d", time.gmtime(now - 90 * 86400)),))
+        self.db.execute("DELETE FROM request_hourly WHERE hour < ?",
                         (time.strftime("%Y-%m-%d", time.gmtime(now - 90 * 86400)),))
         self._last_pruned_day = today
 
@@ -186,29 +188,17 @@ class Store:
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         with self.lock:
             self._prune_locked(now)
-            self.db.execute("""INSERT INTO request_daily
-                (day,account_id,model,outcome,context_tokens,price_period,requests,input_tokens,output_tokens,latency_ms)
-                VALUES (?,?,?,?,?,?,1,?,?,?) ON CONFLICT(day,account_id,model,outcome,context_tokens,price_period) DO UPDATE SET
-                requests=requests+1, input_tokens=input_tokens+excluded.input_tokens,
-                output_tokens=output_tokens+excluded.output_tokens,
-                latency_ms=latency_ms+excluded.latency_ms""",
-                (day, account_id, model, outcome, max(0, input_tokens) if context_tokens is None else context_tokens,
-                 price_period(requested_at if requested_at is not None else now), max(0, input_tokens), max(0, output_tokens), max(0, latency_ms)))
-            self.db.commit()
-
-    def record_quota(self, quota_group: str, plan: str, usage: dict, observed_at: float) -> None:
-        with self.lock:
-            self._prune_locked(observed_at)
-            for window, values in usage.items():
-                previous = self.db.execute("""SELECT observed_at,quota,used,reset_time FROM quota_snapshots
-                    WHERE quota_group=? AND window=? ORDER BY observed_at DESC LIMIT 1""",
-                    (quota_group, window)).fetchone()
-                current = (float(values["quota"]), float(values["used"]), values.get("reset_time"))
-                if previous and tuple(previous[k] for k in ("quota", "used", "reset_time")) == current and observed_at - previous["observed_at"] < 300:
-                    continue
-                self.db.execute("""INSERT INTO quota_snapshots
-                    (observed_at,quota_group,plan,window,quota,used,reset_time)
-                    VALUES (?,?,?,?,?,?,?)""", (observed_at, quota_group, plan, window, *current))
+            # Both rollups count the completion hour; pricing still uses request start time.
+            for table, column, bucket in (("request_daily", "day", day),
+                                           ("request_hourly", "hour", time.strftime("%Y-%m-%dT%H:00:00Z", time.gmtime(now)))):
+                self.db.execute(f"""INSERT INTO {table}
+                    ({column},account_id,model,outcome,context_tokens,price_period,requests,input_tokens,output_tokens,latency_ms)
+                    VALUES (?,?,?,?,?,?,1,?,?,?) ON CONFLICT({column},account_id,model,outcome,context_tokens,price_period) DO UPDATE SET
+                    requests=requests+1, input_tokens=input_tokens+excluded.input_tokens,
+                    output_tokens=output_tokens+excluded.output_tokens,
+                    latency_ms=latency_ms+excluded.latency_ms""",
+                    (bucket, account_id, model, outcome, max(0, input_tokens) if context_tokens is None else context_tokens,
+                     price_period(requested_at if requested_at is not None else now), max(0, input_tokens), max(0, output_tokens), max(0, latency_ms)))
             self.db.commit()
 
     def statistics(self, account_id: str | None, days: int) -> dict:
@@ -220,44 +210,28 @@ class Store:
             condition = " AND account_id=?" if account_id else ""
             args = (since_day, account_id) if account_id else (since_day,)
             pricing = self.pricing()
-            daily_groups: dict[tuple[str, str], dict] = {}
-            model_groups: dict[tuple[str, str], dict] = {}
-            for raw in self.db.execute(f"""SELECT day,model,outcome,context_tokens,price_period,requests,input_tokens,output_tokens,latency_ms
-                FROM request_daily WHERE day>=?{condition} ORDER BY day DESC,outcome""", args):
-                row = dict(raw)
-                key = (row["day"], row["outcome"])
-                empty = {"requests": 0,
-                    "input_tokens": 0, "output_tokens": 0, "latency_ms": 0,
-                    "equivalent_cny": 0.0, "unpriced_input_tokens": 0, "unpriced_output_tokens": 0}
-                priced = {**empty, **row}
-                priced.update(price_usage(pricing, row["model"], row["context_tokens"], row["input_tokens"], row["output_tokens"], row["price_period"]))
-                daily_item = daily_groups.setdefault(key, {**empty, "day": key[0], "outcome": key[1]})
-                model_item = model_groups.setdefault((row["day"], row["model"]),
-                    {**empty, "day": row["day"], "model": row["model"]})
-                for item in (daily_item, model_item):
-                    for field in empty:
-                        item[field] += priced[field]
-            daily = list(daily_groups.values())
-            group_condition = "AND quota_group=?" if account else ""
-            group_args = (time.time() - days * 86400, account["quota_group"]) if account else (time.time() - days * 86400,)
-            history = [dict(row) for row in self.db.execute(f"""SELECT observed_at,quota_group,plan,window,quota,used,reset_time
-                FROM quota_snapshots WHERE observed_at>=? {group_condition} ORDER BY observed_at DESC LIMIT 200""", group_args)]
-            current = []
-            representatives = {}
-            for row in self.accounts():
-                if account and row["quota_group"] != account["quota_group"]:
-                    continue
-                previous = representatives.get(row["quota_group"])
-                if row["usage"] and (previous is None or (row["quota_checked_at"] or 0) > (previous["quota_checked_at"] or 0)):
-                    representatives[row["quota_group"]] = row
-            for row in representatives.values():
-                for window, values in row["usage"].items():
-                    current.append({"quota_group": row["quota_group"], "plan": row["plan"],
-                                    "window": window, "quota": values["quota"], "used": values["used"],
-                                    "reset_time": values.get("reset_time"), "observed_at": row["quota_checked_at"],
-                                    "quota_error": row["quota_error"]})
-            return {"daily": daily, "model_daily": list(model_groups.values()),
-                    "quota_history": history, "quota_current": current}
+            result = {"hourly_started_at": float(self.setting("hourly_started_at", "0"))}
+            for table, column in (("request_daily", "day"), ("request_hourly", "hour")):
+                outcome_groups: dict[tuple[str, str], dict] = {}
+                model_groups: dict[tuple[str, str], dict] = {}
+                for raw in self.db.execute(f"""SELECT {column},model,outcome,context_tokens,price_period,requests,input_tokens,output_tokens,latency_ms
+                    FROM {table} WHERE {column}>=?{condition} ORDER BY {column} DESC,outcome""", args):
+                    row = dict(raw)
+                    key = (row[column], row["outcome"])
+                    empty = {"requests": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0,
+                             "equivalent_cny": 0.0, "unpriced_input_tokens": 0, "unpriced_output_tokens": 0}
+                    priced = {**empty, **row}
+                    priced.update(price_usage(pricing, row["model"], row["context_tokens"], row["input_tokens"], row["output_tokens"], row["price_period"]))
+                    outcome_item = outcome_groups.setdefault(key, {**empty, column: key[0], "outcome": key[1]})
+                    model_item = model_groups.setdefault((row[column], row["model"]),
+                        {**empty, column: row[column], "model": row["model"]})
+                    for item in (outcome_item, model_item):
+                        for field in empty:
+                            item[field] += priced[field]
+                suffix = "daily" if column == "day" else "hourly"
+                result[suffix] = list(outcome_groups.values())
+                result[f"model_{suffix}"] = list(model_groups.values())
+            return result
 
     def pricing(self) -> dict:
         return json.loads(self.setting("pricing", '{"default":{},"models":{}}'))

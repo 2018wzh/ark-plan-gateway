@@ -115,11 +115,12 @@ def classify_error(status: int, body: bytes, headers: dict, now: float) -> tuple
         return "model", None
     if status == 401 or code in {"AuthenticationError", "InvalidApiKey", "InvalidAPIKey"}:
         return "auth", None
-    if code.startswith("QuotaExceeded.AgentPlan") or (code == "QuotaExceeded" and re.search(
-            r"(?:5.hour|weekly|monthly|usage quota|额度.*(?:耗尽|超出))", message, re.I)):
-        return "quota", reset_from_error(data, now)
     if code == "SetLimitExceeded" or (code == "QuotaExceeded" and re.search(r"free trial|免费试用", message, re.I)):
         return "model_limit", None
+    if code.startswith("QuotaExceeded.AgentPlan") or (code == "QuotaExceeded" and re.search(
+            r"(?:5.hour|daily|per.day|weekly|monthly|usage quota|每日|每天|日配额|额度.*(?:耗尽|超出))", message, re.I)):
+        resets = [value for value in (reset_from_error(data, now), retry_after(headers, now)) if value is not None]
+        return "quota", max(resets) if resets else None
     if status == 429 or code in OVERLOAD_ERRORS | RATE_ERRORS:
         if code in OVERLOAD_ERRORS:
             return "overload", retry_after(headers, now)

@@ -1,3 +1,4 @@
+import QuotaOverview from './QuotaOverview';
 import {Badge, Card, Space, Tag, Typography} from 'antd';
 import {Account, accountStatus, usableModels} from './accounts';
 import {poolCooldown,formatWait} from './cooldown';
@@ -27,5 +28,6 @@ export default function GlobalStatus({accounts,now}:{accounts:Account[],now:numb
       {!cooldown.exact&&cooldown.until!==null&&<Typography.Text type="secondary">部分账号恢复时间未知，此时间不是全池精确最短值。</Typography.Text>}
       <Typography.Text type="secondary">{active.length?'其他活跃账号仍可处理请求。':'恢复后由后续请求或额度刷新确认可用。'}</Typography.Text>
     </div>}</div>
+    <QuotaOverview accounts={accounts}/>
   </Card>;
 }

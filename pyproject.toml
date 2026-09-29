@@ -1,6 +1,6 @@
 [project]
 name = "ark-plan-gateway"
-version = "0.7.0"
+version = "0.8.0"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1", "httpx>=0.27,<1", "anyio>=4,<5", "cryptography>=43,<47", "python-dotenv>=1,<2", "volcengine>=1.0.228,<2"]
 

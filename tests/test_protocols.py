@@ -264,3 +264,27 @@ async def test_chat_disconnect_closes_upstream_and_releases_account(setup):
     assert first_sent.is_set() and closed.is_set() and len(calls) == 1
     assert app.state.pool.inflight[account] == 0
     assert store.statistics(None, 1)['daily'][0]['outcome'] == 'client_disconnected'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stream', [False, True])
+async def test_daily_quota_stream_error_cools_account_without_replay(setup, stream):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    calls = []
+    reset = time.time() + 3600
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(200, stream=BytesStream(sse(
+            {'type': 'error', 'error': {'code': 'QuotaExceeded', 'message': 'daily quota exhausted', 'reset_time': reset}})),
+            headers={'content-type': 'text/event-stream'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model': 'm', 'input': 'test', 'stream': stream})
+            assert response.status_code == (200 if stream else 502)
+    assert len(calls) == 1
+    cooling = [a for a in store.accounts() if a['cooldown_kind'] == 'quota']
+    assert len(cooling) == 1 and cooling[0]['cooldown_until'] == reset
+    assert len(await app.state.pool.candidates('m')) == 1
