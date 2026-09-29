@@ -1,4 +1,4 @@
-FROM node:22-alpine AS web
+FROM --platform=$BUILDPLATFORM node:22-alpine AS web
 WORKDIR /build/web
 COPY web/package*.json ./
 RUN npm ci --no-audit --no-fund
