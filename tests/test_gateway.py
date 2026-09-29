@@ -68,6 +68,21 @@ async def test_persisted_cooldown_survives_pool_restart(store):
 
 
 @pytest.mark.asyncio
+async def test_equal_accounts_rotate_and_recovery_probe_is_transient(store):
+    first = store.add_account("agent", "key-first", models=["m"])
+    second = store.add_account("coding", "key-second", models=["m"])
+    pool = AccountPool(store)
+    choices = [(await pool.candidates("m"))[0]["id"] for _ in range(2)]
+    assert set(choices) == {first, second}
+    store.update(first, cooldown_kind="quota", cooldown_until=time.time() - 1)
+    account = store.account(first, True)
+    assert await pool.reserve(account)
+    status, code, retry_at, _ = pool.unavailable("m", first)
+    assert status == 429 and code == "rate_limited" and retry_at > time.time()
+    await pool.release(account)
+
+
+@pytest.mark.asyncio
 async def test_afp_uses_latest_exhausted_window_reset(store, monkeypatch):
     from gateway import quota
     a = store.add_account("agent", "key-agent", models=["m"])

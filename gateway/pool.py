@@ -112,9 +112,10 @@ class AccountPool:
                 ratio = remaining_ratio(a["usage"])
                 eligible.append((a, ratio, bool(kind == "quota")))
             self.sequence += 1
+            order = {a["id"]: i for i, a in enumerate(accounts)}
             eligible.sort(key=lambda entry: (entry[1] is None, -(entry[1] or 0),
                                              self.inflight.get(entry[0]["id"], 0),
-                                             (hash(entry[0]["id"]) + self.sequence) % max(len(accounts), 1)))
+                                             (order[entry[0]["id"]] - self.sequence) % max(len(accounts), 1)))
             return [a for a, _, _ in eligible]
 
     async def reserve(self, account: dict) -> bool:
@@ -157,6 +158,8 @@ class AccountPool:
     def unavailable(self, model: str, pinned: str | None = None):
         now = time.time()
         accounts = [a for a in self.store.accounts() if model in a["models"] and (not pinned or a["id"] == pinned) and a["enabled"]]
+        if any(a["quota_group"] in self.probing for a in accounts):
+            return 429, "rate_limited", now + 1, False
         states = []
         for a in accounts:
             if a["auth_failed"] or a["expired"]:
