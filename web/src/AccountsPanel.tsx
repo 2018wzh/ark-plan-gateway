@@ -2,7 +2,8 @@ import {useRef,useState} from 'react';
 import {Alert, Button, Card, Dropdown, Empty, Input, message, Modal, Progress, Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography} from 'antd';
 import {ClockCircleOutlined, MoreOutlined, SearchOutlined, TeamOutlined, CheckCircleOutlined, PauseCircleOutlined, ThunderboltOutlined} from '@ant-design/icons';
 import {api,errorText} from './api';
-import {Account,accountStatus,formatTime,lowestQuota,quotaColor,remaining,StatusBadge,windowName} from './accounts';
+import {Account,accountStatus,formatTime,quotaColor,remaining,StatusBadge,windowName} from './accounts';
+import GlobalStatus from './GlobalStatus';
 
 export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accounts:Account[],onEdit:(account:Account)=>void,reload:()=>Promise<void>,updatedAt:number|null}){
   const [query,setQuery]=useState(''),[plan,setPlan]=useState<string>(),[status,setStatus]=useState<string>();
@@ -22,13 +23,6 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
   };
   const details=(account:Account)=><div className="account-details">
     {account.quota_error&&<Alert type="warning" showIcon message={`额度可能已过期：${account.quota_error}`}/>}
-    <div className="quota-grid">{Object.entries(account.usage).map(([name,usage])=>{
-      const value=remaining(usage);
-      return <div className="quota-window" key={name}><div className="quota-heading"><b>{windowName(name)}</b><span>{value===null?'未知':`${value.toFixed(1)}% 剩余`}</span></div>
-        <Progress percent={value??0} showInfo={false} strokeColor={quotaColor(value??100)} size="small"/>
-        <Typography.Text type="secondary">{account.plan==='coding'?`${usage.used.toFixed(1)}% 已用`:`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:2})} / ${usage.quota.toLocaleString()} AFP`}</Typography.Text>
-        <small>{formatTime(usage.reset_time)}</small></div>;
-    })}</div>
     {!Object.keys(account.usage).length&&<Typography.Text type="secondary">尚无官方额度数据。{account.has_ak_sk?'点击「刷新额度」重新查询。':'编辑账号并配置 AK/SK 可启用额度查询。'}</Typography.Text>}
     <div className="detail-meta"><span>更新时间：{account.quota_checked_at?formatTime(account.quota_checked_at):'尚未查询'}</span><span>额度主体：{accounts.find(a=>a.id===account.quota_group)?.label||'未找到'}</span>
       <span>查询凭据：{account.has_ak_sk?'已配置':'未配置'}</span>{account.cooldown_kind&&<span>恢复时间：{formatTime(account.cooldown_until)}</span>}</div>
@@ -36,6 +30,7 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
   const metrics=[{label:'全部账号',value:accounts.length,icon:<TeamOutlined/>},{label:'活跃账号',value:accounts.filter(a=>accountStatus(a).key==='active').length,icon:<CheckCircleOutlined/>,color:'#158f98'},{label:'冷却账号',value:accounts.filter(a=>accountStatus(a).key==='cooling').length,icon:<PauseCircleOutlined/>,color:'#d76542'},{label:'当前并发',value:accounts.reduce((n,a)=>n+(a.inflight||0),0),icon:<ThunderboltOutlined/>}];
   return <div className="page-stack">{context}{modalContext}
     <div className="metric-band">{metrics.map(metric=><Statistic key={metric.label} title={<Space>{metric.icon}{metric.label}</Space>} value={metric.value} valueStyle={{color:metric.color}}/>)}</div>
+    <GlobalStatus accounts={accounts}/>
     <Card className="accounts-card" styles={{body:{padding:0}}}>
       <div className="table-toolbar"><Input prefix={<SearchOutlined/>} aria-label="搜索账号或模型" placeholder="搜索账号或模型" value={query} onChange={e=>setQuery(e.target.value)} allowClear className="account-search"/>
         <Select aria-label="套餐筛选" placeholder="全部套餐" allowClear value={plan} onChange={setPlan} options={[{value:'agent',label:'Agent Plan'},{value:'coding',label:'Coding Plan'}]}/>
@@ -46,7 +41,14 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
         expandable={{expandedRowRender:details,columnWidth:36}} columns={[
           {title:'账号',width:210,render:(_,a)=><div className="account-name"><strong>{a.label}</strong><span><Tag bordered={false} color={a.plan==='agent'?'cyan':'blue'}>{a.plan==='agent'?'Agent':'Coding'}</Tag><code>{a.api_key_mask}</code></span></div>},
           {title:'支持模型',width:180,render:(_,a)=><div className="model-list">{a.models.map(model=><span key={model}>{model}</span>)}</div>},
-          {title:'可用额度',width:220,render:(_,a)=>{const quota=lowestQuota(a);return quota?<div className="quota-summary"><Progress percent={quota.value} strokeColor={quotaColor(quota.value)} size="small" format={v=>`${v?.toFixed(1)}%`}/><small>{a.quota_error?'旧值 · ':''}最低剩余窗口：{windowName(quota.name)}</small></div>:<Typography.Text type="secondary">未知{!a.has_ak_sk?' · 未配置 AK/SK':''}</Typography.Text>}},
+          {title:'可用额度',width:300,render:(_,a)=>Object.keys(a.usage).length?<div className="quota-rows">{Object.entries(a.usage).map(([name,usage])=>{
+            const value=remaining(usage);
+            return <div className="quota-row" key={name}>
+              <div className="quota-row-heading"><span>{windowName(name)}</span><span>{value===null?'未知':`${value.toFixed(1)}% 剩余`}</span></div>
+              <Progress aria-label={`${a.label} ${windowName(name)}剩余额度`} percent={value??0} showInfo={false} strokeColor={value===null?'#91a0a6':quotaColor(value)} size="small"/>
+              <div className="quota-row-meta"><span>{a.plan==='coding'?`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})}% 已用`:`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})} / ${usage.quota.toLocaleString()} AFP`}</span><Tooltip title={formatTime(usage.reset_time)}><span>{usage.reset_time&&usage.reset_time>0?`${new Date(usage.reset_time*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})} 重置`:'重置时间未知'}</span></Tooltip></div>
+            </div>;
+          })}{a.quota_error&&<Typography.Text type="warning">查询失败，显示上次额度</Typography.Text>}</div>:<Typography.Text type="secondary">未知{!a.has_ak_sk?' · 未配置 AK/SK':''}</Typography.Text>},
           {title:'状态',width:115,render:(_,a)=><div className="account-state"><StatusBadge account={a}/>{accountStatus(a).key==='cooling'&&<small>{a.cooldown_until?`至 ${new Date(a.cooldown_until*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'恢复时间未知'}</small>}</div>},
           {title:'操作',fixed:'right',width:165,render:(_,a)=><Space size={8}><Tooltip title={a.enabled?'停用账号':'启用账号'}><Switch size="small" aria-label={`${a.label} 启停`} checked={!!a.enabled} loading={pending.includes(a.id)} onChange={enabled=>act(a,'toggle',enabled)}/></Tooltip>
             <Button size="small" onClick={()=>onEdit(a)} disabled={pending.includes(a.id)}>编辑</Button>
@@ -54,6 +56,6 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
         ]}/>
       <div className="table-footer"><ClockCircleOutlined/> 每 15 秒自动更新 <span>上次更新：{updatedAt?new Date(updatedAt).toLocaleTimeString('zh-CN',{hour12:false}):'—'}</span></div>
     </Card>
-    <Typography.Text className="page-note" type="secondary">可用额度取限制窗口中的最低剩余比例，展开账号可查看各窗口详情。</Typography.Text>
+    <Typography.Text className="page-note" type="secondary">各行显示对应限制窗口的剩余额度；展开账号可查看查询状态和共享额度主体。</Typography.Text>
   </div>;
 }

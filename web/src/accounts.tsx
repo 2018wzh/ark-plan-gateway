@@ -14,7 +14,3 @@ export function accountStatus(account:Account,now=Date.now()/1000){
   return {key:'active',label:'活跃',color:'#16a085'};
 }
 export function StatusBadge({account}:{account:Account}){const status=accountStatus(account);return <Badge color={status.color} text={status.label}/>}
-export function lowestQuota(account:Account){
-  return Object.entries(account.usage).map(([name,usage])=>({name,value:remaining(usage)}))
-    .filter((item):item is {name:string,value:number}=>item.value!==null).sort((a,b)=>a.value-b.value)[0];
-}
