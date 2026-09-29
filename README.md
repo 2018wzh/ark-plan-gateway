@@ -56,7 +56,7 @@ if response.status_code == 429:
 
 ## 额度语义
 
-Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsage`；多限制窗口任一耗尽即冷却，恢复时间取已耗尽窗口最晚重置时间。Coding Plan 个人版的 `GetPersonalPlan` 只报告套餐状态，不报告剩余额度；未知额度显示为未知，依据上游套餐耗尽错误切换。普通 RPM/TPM 限流独立短退避。无可信重置时间时返回 `plan_quota_exhausted`；有可信时间时返回 `plan_pool_cooling_down` 和 `Retry-After`。
+Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsage`；多限制窗口任一耗尽即冷却，恢复时间取已耗尽窗口最晚重置时间。Coding Plan 配置 AK/SK 后请求[官方 Ark CLI 所用的 `GetCodingPlanUsage`](https://github.com/volcengine/ark-cli/blob/main/skills/arkcli-usage/references/arkcli-usage-plan.md)，展示各窗口官方已用百分比和重置时间。推理 API Key 不能直接查询该管理接口；未配置 AK/SK 时额度显示“未知”，仍根据请求中观察到的套餐耗尽错误切换账号。普通 RPM/TPM 限流独立短退避。无可信重置时间时返回 `plan_quota_exhausted`；有可信时间时返回 `plan_pool_cooling_down` 和 `Retry-After`。
 
 同一套餐下属于同一额度主体的多个密钥可在账号编辑页指定同一个额度主体。不同套餐的同名模型可互为候选；需要别名时，在账号编辑页按 `别名=上游模型` 配置模型映射。`previous_response_id` 始终回到创建它的账号。密钥、提示词、完整上游错误不写入日志；数据库、`.env` 和静态构建物不进入 Git。请备份 `.env` 中的主密钥，否则数据库中的账号密钥无法解密。
 
@@ -64,7 +64,9 @@ Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsag
 
 登录[火山引擎 API 访问密钥页面](https://docs.volcengine.com/docs/6291/65568?lang=zh)，为当前身份创建 Access Key ID 和 Secret Access Key；如果使用 IAM 子用户，在该用户详情的「密钥」页创建。该凭据与模型推理 API Key 不同，应属于套餐所在的账号，并具有查询方舟管理接口的权限。进入网关「账号与额度」→「编辑」，分别填写 Access Key 和 Secret Key，保存后点「刷新」。界面不会回显密钥。
 
-「额度与统计」页可选择全部账号或单个账号、最近 7/30/90 天。官方额度查询结果保存为历史快照，同一额度主体在全局当前额度中只计算一次。请求统计按账号记录网关发起的上游尝试，包含结果、耗时及上游返回的 Token 用量；切换账号时一次下游请求会产生多次尝试。未报告的 Token 数不作估算。Coding Plan 当前没有可用的官方剩余额度接口，故额度保持未知；请求统计不能当成官方剩余额度。统计不保存提示词或生成内容，额度快照和每日请求汇总保留 90 天。
+「额度与统计」页可选择全部账号或单个账号、最近 7/30/90 天。官方额度查询结果保存为历史快照，同一额度主体在全局当前额度中只计算一次。Coding Plan 返回百分比而非绝对 Token 数；全局展示多个额度主体时用平均百分比。请求统计按账号和模型记录网关发起的上游尝试，包含结果、耗时及上游返回的 Token 用量；切换账号时一次下游请求会产生多次尝试。未报告的 Token 数不作估算。统计不保存提示词或生成内容，额度快照和每日请求汇总保留 90 天。
+
+「模型定价」页按人民币/百万 Token 设置默认输入、输出定价，并可逐模型覆盖。统计页的“等效价格”只按已报告 Token 和配置单价估算，不是实际账单；缺少单价的 Token 单独计数。旧版请求统计没有模型名称，升级后保留并使用默认定价估算。
 
 ## 开发
 

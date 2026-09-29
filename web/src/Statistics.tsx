@@ -1,13 +1,15 @@
 import {useEffect, useState} from 'react';
-import {Alert, Card, Select, Space, Statistic, Table, Typography} from 'antd';
+import {Alert, Card, Progress, Select, Space, Statistic, Table, Typography} from 'antd';
 
 type Account = {id:string,label:string,plan:string};
-type Daily = {day:string,outcome:string,requests:number,input_tokens:number,output_tokens:number,latency_ms:number};
+type Daily = {day:string,outcome:string,requests:number,input_tokens:number,output_tokens:number,latency_ms:number,equivalent_cny:number,unpriced_input_tokens:number,unpriced_output_tokens:number};
 type Quota = {quota_group:string,plan:string,window:string,quota:number,used:number,reset_time:number|null,observed_at:number|null,quota_error?:string|null};
 type Data = {daily:Daily[],quota_current:Quota[],quota_history:Quota[]};
 type Api = (path:string)=>Promise<Data>;
 
 const fmt = (value:number|null) => value ? new Date(value*1000).toLocaleString('zh-CN') : '—';
+const money = (value:number) => `¥${value.toFixed(4)}`;
+const progress = (row:Quota) => {const used=row.quota>0?Math.min(100,Math.max(0,row.used/row.quota*100)):0;return <Progress percent={used} size="small" strokeColor={used>=85?'#cf3c3c':used>=60?'#d99820':'#2f9e69'} format={()=>`${(100-used).toFixed(1)}% 剩余`}/>};
 const outcomeNames:Record<string,string> = {
   success:'成功', quota:'套餐额度耗尽', rate:'RPM/TPM 限流', auth:'鉴权失败',
   rejected:'上游拒绝', transport_error:'传输失败', response_error:'响应失败',
@@ -32,7 +34,8 @@ export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) 
   const totals = data.daily.reduce((sum,row) => ({
     requests:sum.requests+row.requests,success:sum.success+(row.outcome==='success'?row.requests:0),
     input:sum.input+row.input_tokens,output:sum.output+row.output_tokens,
-  }),{requests:0,success:0,input:0,output:0});
+    equivalent:sum.equivalent+row.equivalent_cny,unpriced:sum.unpriced+row.unpriced_input_tokens+row.unpriced_output_tokens,
+  }),{requests:0,success:0,input:0,output:0,equivalent:0,unpriced:0});
   const current = new Map<string,Quota&{groups:number}>();
   for(const item of data.quota_current){
     const key = `${item.plan}/${item.window}`;
@@ -50,12 +53,13 @@ export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) 
     </Space>
     {error && <Alert type="error" message={error}/>}
     <div className="stats stats-four"><Card><Statistic title="上游尝试" value={totals.requests}/></Card><Card><Statistic title="成功" value={totals.success}/></Card><Card><Statistic title="输入 Token（已报告）" value={totals.input}/></Card><Card><Statistic title="输出 Token（已报告）" value={totals.output}/></Card></div>
+    <div className="stats"><Card><Statistic title="等效价格（人民币）" value={money(totals.equivalent)}/></Card><Card><Statistic title="未定价 Token" value={totals.unpriced}/></Card></div>
     <Card title="当前官方额度" extra={<Typography.Text type="secondary">共享额度主体已去重；未知额度不计入</Typography.Text>}>
       <Table size="small" pagination={false} scroll={{x:800}} dataSource={quotaRows} locale={{emptyText:'尚无官方额度数据'}} columns={[
         {title:'套餐',dataIndex:'plan',render:(value:string)=>value==='agent'?'Agent Plan':'Coding Plan'},
         {title:'窗口',dataIndex:'window'}, {title:'额度主体',dataIndex:'groups'},
-        {title:'已用 / 总量',render:(_:unknown,row:Quota)=>`${row.used} / ${row.quota}`},
-        {title:'剩余比例',render:(_:unknown,row:Quota)=>row.quota>0?`${Math.max(0,(1-row.used/row.quota)*100).toFixed(1)}%`:'—'},
+        {title:'已用 / 总量',render:(_:unknown,row:Quota)=>row.plan==='coding'?`${(row.used/(row as Quota&{groups:number}).groups).toFixed(1)}% 已用（平均）`:`${row.used} / ${row.quota}`},
+        {title:'剩余比例',render:(_:unknown,row:Quota)=>progress(row)},
         {title:'重置时间',dataIndex:'reset_time',render:fmt},
         {title:'更新时间',dataIndex:'observed_at',render:fmt},
         {title:'查询状态',dataIndex:'quota_error',render:(value:string|null)=>value?<Typography.Text type="warning">旧值 · {value}</Typography.Text>:'正常'},
@@ -65,6 +69,8 @@ export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) 
       {title:'日期（UTC）',dataIndex:'day'}, {title:'结果',dataIndex:'outcome',render:(value:string)=>outcomeNames[value]||value},
       {title:'次数',dataIndex:'requests'}, {title:'输入 Token',dataIndex:'input_tokens'},
       {title:'输出 Token',dataIndex:'output_tokens'},
+      {title:'等效价格',dataIndex:'equivalent_cny',render:money},
+      {title:'未定价 Token',render:(_:unknown,row:Daily)=>row.unpriced_input_tokens+row.unpriced_output_tokens},
       {title:'平均耗时',render:(_:unknown,row:Daily)=>`${Math.round(row.latency_ms/row.requests)} ms`},
     ]}/></Card>
     <Card title="额度查询历史"><Table size="small" rowKey={row=>`${row.quota_group}/${row.window}/${row.observed_at}`} dataSource={data.quota_history} pagination={{pageSize:12}} locale={{emptyText:'尚无额度查询记录；Agent Plan 需先配置 AK/SK'}} scroll={{x:900}} columns={[
@@ -72,7 +78,7 @@ export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) 
       {title:'额度主体',dataIndex:'quota_group',render:(value:string)=>accounts.find(account=>account.id===value)?.label||<code>{value.slice(0,8)}</code>},
       {title:'套餐',dataIndex:'plan',render:(value:string)=>value==='agent'?'Agent Plan':'Coding Plan'},
       {title:'窗口',dataIndex:'window'},
-      {title:'已用 / 总量',render:(_:unknown,row:Quota)=>`${row.used} / ${row.quota}`},
+      {title:'额度',render:(_:unknown,row:Quota)=>row.plan==='coding'?`${row.used.toFixed(1)}% 已用`:progress(row)},
       {title:'重置时间',dataIndex:'reset_time',render:fmt},
     ]}/></Card>
   </Space>;

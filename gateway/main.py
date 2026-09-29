@@ -16,7 +16,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
@@ -87,6 +87,23 @@ class SettingsIn(BaseModel):
     refresh_seconds: int | None = Field(default=None, ge=30, le=3600)
     new_password: str | None = Field(default=None, min_length=12)
     new_service_token: str | None = Field(default=None, min_length=24)
+
+
+class Price(BaseModel):
+    input: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    output: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+
+class PricingIn(BaseModel):
+    default: Price
+    models: dict[str, Price]
+
+    @field_validator("models")
+    @classmethod
+    def valid_models(cls, value: dict[str, Price]) -> dict[str, Price]:
+        if len(value) > 100 or any(not name.strip() or len(name) > 128 for name in value):
+            raise ValueError("invalid model pricing")
+        return value
 
 
 def create_app(store: Store | None = None, client: httpx.AsyncClient | None = None) -> FastAPI:
@@ -285,6 +302,17 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         except KeyError:
             raise HTTPException(404, "account not found")
 
+    @app.get("/api/pricing")
+    async def pricing(request: Request):
+        require_admin(request)
+        return store.pricing()
+
+    @app.put("/api/pricing")
+    async def edit_pricing(body: PricingIn, request: Request):
+        require_admin(request, True)
+        store.set_pricing(body.model_dump(exclude_none=True))
+        return store.pricing()
+
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}
@@ -311,7 +339,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             def record(outcome: str, response_data: object = None):
                 if method == "POST":
                     inputs, outputs = token_usage(response_data)
-                    store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), inputs, outputs)
+                    store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), model, inputs, outputs)
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
             headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json"}

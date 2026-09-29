@@ -34,7 +34,7 @@ def test_statistics_are_persistent_and_shared_quota_is_not_double_counted(tmp_pa
     for account_id in (first, second):
         store.update(account_id, usage_json=json.dumps(usage), quota_checked_at=time.time())
     store.record_quota(first, "agent", usage, time.time())
-    store.record_request(first, "success", 1200, 12, 3)
+    store.record_request(first, "success", 1200, "m", 12, 3)
     store.record_request(second, "rate", 80)
     store.close()
     store = Store(path, key)
@@ -45,6 +45,35 @@ def test_statistics_are_persistent_and_shared_quota_is_not_double_counted(tmp_pa
     assert sum(row["input_tokens"] for row in all_stats["daily"]) == 12
     assert sum(row["requests"] for row in store.statistics(first, 7)["daily"]) == 1
     assert sum(row["requests"] for row in store.statistics(second, 7)["daily"]) == 1
+    store.close()
+
+
+def test_pricing_model_override_default_and_missing_rate(store):
+    account = store.add_account("coding", "key-coding", models=["m", "n"])
+    store.record_request(account, "success", 10, "m", 1_000_000, 500_000)
+    store.record_request(account, "success", 10, "n", 200_000, 300_000)
+    store.set_pricing({"default": {"input": 2}, "models": {"m": {"input": 4, "output": 8}}})
+    row = store.statistics(account, 1)["daily"][0]
+    assert row["equivalent_cny"] == pytest.approx(8.4)
+    assert row["unpriced_output_tokens"] == 300_000
+    assert row["unpriced_input_tokens"] == 0
+
+
+def test_legacy_statistics_migrate_without_losing_tokens(tmp_path):
+    path = str(tmp_path / "legacy.db")
+    key = Fernet.generate_key().decode()
+    store = Store(path, key)
+    store.db.execute("DROP TABLE request_daily")
+    store.db.execute("""CREATE TABLE request_daily (day TEXT, account_id TEXT, outcome TEXT,
+        requests INTEGER, input_tokens INTEGER, output_tokens INTEGER, latency_ms INTEGER,
+        PRIMARY KEY(day,account_id,outcome))""")
+    store.db.execute("INSERT INTO request_daily VALUES (date('now'),'a','success',1,7,3,12)")
+    store.db.commit()
+    store.close()
+    store = Store(path, key)
+    row = store.statistics(None, 1)["daily"][0]
+    assert row["input_tokens"] == 7 and row["output_tokens"] == 3
+    assert row["unpriced_input_tokens"] == 7
     store.close()
 
 
@@ -126,6 +155,39 @@ async def test_afp_uses_latest_exhausted_window_reset(store, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_coding_usage_percent_and_shared_cooldown(store, monkeypatch):
+    from gateway import quota
+    first = store.add_account("coding", "coding-key-one", models=["m"])
+    second = store.add_account("coding", "coding-key-two", models=["m"])
+    store.set_quota_group(second, first)
+    store.update(first, access_key="ak", secret_key="sk")
+    now = time.time()
+    async def fake_call(action, ak, sk, body):
+        assert action == "GetCodingPlanUsage"
+        return {"Status":"Running", "QuotaUsage":[
+            {"Level":"session","Percent":100,"ResetTimestamp":int(now+30)},
+            {"Level":"weekly","Percent":100,"ResetTimestamp":int(now+90)},
+            {"Level":"monthly","Percent":20,"ResetTimestamp":-1}]}
+    monkeypatch.setattr(quota, "management_call", fake_call)
+    await quota.refresh_account(store, store.account(first, True))
+    for account_id in (first, second):
+        row = store.account(account_id)
+        assert row["cooldown_kind"] == "quota"
+        assert 80 < row["cooldown_until"]-now < 100
+        assert row["usage"]["monthly"]["unit"] == "percent"
+    assert len(store.statistics(None, 1)["quota_current"]) == 3
+
+
+def test_coding_usage_rejects_invalid_percent():
+    from gateway.quota import parse_coding_usage
+    result = parse_coding_usage({"QuotaUsage":[
+        {"Level":"session","Percent":-1,"ResetTimestamp":1},
+        {"Level":"weekly","Percent":125,"ResetTimestamp":1},
+        {"Level":"monthly","Percent":42.5,"ResetTimestamp":-1}]})
+    assert result == {"monthly":{"quota":100.0,"used":42.5,"reset_time":None,"unit":"percent"}}
+
+
+@pytest.mark.asyncio
 async def test_sync_failover_and_pinned_continuation(store, monkeypatch):
     monkeypatch.setenv("ARK_GATEWAY_ADMIN_PASSWORD", "admin-password-123")
     monkeypatch.setenv("ARK_GATEWAY_SERVICE_TOKEN", "service-token-123456789012345")
@@ -157,6 +219,11 @@ async def test_sync_failover_and_pinned_continuation(store, monkeypatch):
         assert (await client.post("/api/login", json={"password":"admin-password-123"})).status_code == 200
         assert (await client.get("/api/statistics?days=1")).json()["daily"]
         assert (await client.get("/api/statistics?days=91")).status_code == 400
+        assert (await client.put("/api/pricing", json={"default":{"input":2,"output":4},"models":{"m":{"input":3}}})).status_code == 200
+        assert (await client.get("/api/pricing")).json()["models"]["m"]["input"] == 3
+        priced = next(row for row in store.statistics(None, 1)["daily"] if row["outcome"] == "success")
+        assert priced["equivalent_cny"] == pytest.approx(29 / 1_000_000)
+        assert (await client.put("/api/pricing", json={"default":{"input":-1},"models":{}})).status_code == 422
         r = await client.post("/v1/responses", headers=headers, json={"model":"m", "previous_response_id":"resp_123", "input":"more"})
         assert r.status_code == 200 and calls[-1][1] == "Bearer key-coding"
     await upstream_client.aclose()
