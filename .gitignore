@@ -1,0 +1,13 @@
+.venv/
+.env
+.env.*
+!.env.example
+*.db
+*.db-*
+__pycache__/
+.pytest_cache/
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
+gateway/static/
+data/

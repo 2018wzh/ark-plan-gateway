@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+.venv
+data
+tests
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
+gateway/static
+**/__pycache__
+**/*.pyc
