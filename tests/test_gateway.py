@@ -92,6 +92,7 @@ async def test_sync_failover_and_pinned_continuation(store, monkeypatch):
     from gateway.main import create_app
     a = store.add_account("agent", "key-agent", models=["m"])
     c = store.add_account("coding", "key-coding", models=["m"])
+    store.update(c, model_mapping={"m": "actual-model"})
     store.update(a, usage_json=json.dumps({"five": {"quota": 100, "used": 10, "reset_time": time.time()+60}}))
     calls = []
     def upstream(req):
@@ -106,6 +107,7 @@ async def test_sync_failover_and_pinned_continuation(store, monkeypatch):
         r = await client.post("/v1/responses", headers=headers, json={"model":"m", "input":"hello"})
         assert r.status_code == 200 and r.json()["id"] == "resp_123"
         assert len(calls) == 2 and calls[0][1] == "Bearer key-agent" and calls[1][1] == "Bearer key-coding"
+        assert calls[1][2]["model"] == "actual-model"
         r = await client.post("/v1/responses", headers=headers, json={"model":"m", "previous_response_id":"resp_123", "input":"more"})
         assert r.status_code == 200 and calls[-1][1] == "Bearer key-coding"
     await upstream_client.aclose()

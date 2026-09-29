@@ -25,7 +25,7 @@ class Store:
           id TEXT PRIMARY KEY, plan TEXT NOT NULL, label TEXT NOT NULL,
           key_hash TEXT NOT NULL UNIQUE, api_key TEXT NOT NULL,
           access_key TEXT, secret_key TEXT, quota_group TEXT NOT NULL,
-          models TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+          models TEXT NOT NULL, model_mapping TEXT NOT NULL DEFAULT '{}', enabled INTEGER NOT NULL DEFAULT 1,
           auth_failed INTEGER NOT NULL DEFAULT 0, expired INTEGER NOT NULL DEFAULT 0,
           cooldown_until REAL, cooldown_kind TEXT, quota_checked_at REAL,
           quota_error TEXT, usage_json TEXT NOT NULL DEFAULT '{}',
@@ -37,6 +37,8 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
+        if "model_mapping" not in {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}:
+            self.db.execute("ALTER TABLE accounts ADD COLUMN model_mapping TEXT NOT NULL DEFAULT '{}'")
         self.db.commit()
 
     def _enc(self, value: str | None) -> str | None:
@@ -48,6 +50,7 @@ class Store:
     def _row(self, row: sqlite3.Row, private: bool = False) -> dict:
         d = dict(row)
         d["models"] = json.loads(d["models"])
+        d["model_mapping"] = json.loads(d["model_mapping"])
         d["usage"] = json.loads(d.pop("usage_json"))
         d["api_key_mask"] = "••••" + self._dec(d["api_key"])[-4:]
         d["has_ak_sk"] = bool(d["access_key"] and d["secret_key"])
@@ -82,11 +85,13 @@ class Store:
             return account_id
 
     def update(self, account_id: str, **fields) -> None:
-        allowed = {"plan", "label", "quota_group", "models", "enabled", "auth_failed", "expired",
+        allowed = {"plan", "label", "quota_group", "models", "model_mapping", "enabled", "auth_failed", "expired",
                    "cooldown_until", "cooldown_kind", "quota_checked_at", "quota_error", "usage_json", "active"}
         data = {k: v for k, v in fields.items() if k in allowed}
         if "models" in data:
             data["models"] = json.dumps(data["models"])
+        if "model_mapping" in data:
+            data["model_mapping"] = json.dumps(data["model_mapping"])
         with self.lock:
             if data:
                 self.db.execute("UPDATE accounts SET " + ", ".join(f"{k}=?" for k in data) + " WHERE id=?",

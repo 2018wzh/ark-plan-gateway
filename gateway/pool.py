@@ -167,11 +167,13 @@ class AccountPool:
             return 503, "no_valid_account", None, False
         quota = [(k, v) for k, v in states if k == "quota"]
         known = [v for _, v in quota if v and v > now]
+        rate = [v for k, v in states if k == "rate" and v and v > now]
+        if rate and known and min(rate) < min(known):
+            return 429, "rate_limited", min(rate), False
         if known:
             return 429, "plan_pool_cooling_down", min(known), len(quota) == len(states) and len(known) == len(quota)
         if quota:
             return 429, "plan_quota_exhausted", None, False
-        rate = [v for k, v in states if k == "rate" and v and v > now]
         if rate:
             return 429, "rate_limited", min(rate), True
         return 503, "no_available_account", None, False

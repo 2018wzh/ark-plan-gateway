@@ -55,11 +55,13 @@ class AccountIn(BaseModel):
     api_key: str = Field(min_length=5)
     label: str = Field(min_length=1, max_length=100)
     models: list[str] = Field(default_factory=lambda: ["ark-code-latest"])
+    model_mapping: dict[str, str] = Field(default_factory=dict)
 
 
 class AccountPatch(BaseModel):
     label: str | None = None
     models: list[str] | None = None
+    model_mapping: dict[str, str] | None = None
     enabled: bool | None = None
     quota_group: str | None = None
     api_key: str | None = None
@@ -192,7 +194,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     @app.post("/api/accounts")
     async def add_account(body: AccountIn, request: Request):
         require_admin(request, True)
+        if not body.models or any(k not in body.models or not v for k, v in body.model_mapping.items()):
+            raise HTTPException(400, "model mapping must use configured model names")
         account_id = store.add_account(body.plan, body.api_key, body.label, body.models)
+        if body.model_mapping:
+            store.update(account_id, model_mapping=body.model_mapping)
         return store.account(account_id)
 
     @app.patch("/api/accounts/{account_id}")
@@ -207,6 +213,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 raise HTTPException(400, "quota group must refer to an account in the same plan")
         if "models" in data and (not data["models"] or not all(isinstance(x, str) and x for x in data["models"])):
             raise HTTPException(400, "models required")
+        if "model_mapping" in data and any(k not in (data.get("models") or store.account(account_id)["models"]) or not v for k,v in data["model_mapping"].items()):
+            raise HTTPException(400, "model mapping must use configured model names")
         store.update(account_id, **data)
         return store.account(account_id)
 
@@ -285,7 +293,13 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             if stream:
                 headers["Accept"] = "text/event-stream"
             try:
-                req = client.build_request(method, url, content=body, headers=headers)
+                account_body = body
+                mapped = account["model_mapping"].get(model)
+                if method == "POST" and mapped and mapped != model:
+                    account_json = json.loads(body)
+                    account_json["model"] = mapped
+                    account_body = json.dumps(account_json, ensure_ascii=False).encode()
+                req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
             except (httpx.TimeoutException, httpx.TransportError):
                 await pool.release(account)
