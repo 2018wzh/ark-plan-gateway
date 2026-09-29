@@ -192,23 +192,29 @@ class Store:
             args = (since_day, account_id) if account_id else (since_day,)
             pricing = self.pricing()
             daily_groups: dict[tuple[str, str], dict] = {}
+            model_groups: dict[tuple[str, str], dict] = {}
             for raw in self.db.execute(f"""SELECT day,model,outcome,requests,input_tokens,output_tokens,latency_ms
                 FROM request_daily WHERE day>=?{condition} ORDER BY day DESC,outcome""", args):
                 row = dict(raw)
                 key = (row["day"], row["outcome"])
-                item = daily_groups.setdefault(key, {"day": key[0], "outcome": key[1], "requests": 0,
+                empty = {"requests": 0,
                     "input_tokens": 0, "output_tokens": 0, "latency_ms": 0,
-                    "equivalent_cny": 0.0, "unpriced_input_tokens": 0, "unpriced_output_tokens": 0})
-                for field in ("requests", "input_tokens", "output_tokens", "latency_ms"):
-                    item[field] += row[field]
+                    "equivalent_cny": 0.0, "unpriced_input_tokens": 0, "unpriced_output_tokens": 0}
+                priced = {**empty, **row}
                 rates = pricing["models"].get(row["model"], {})
                 for side in ("input", "output"):
                     tokens = row[f"{side}_tokens"]
                     rate = rates.get(side, pricing["default"].get(side))
                     if rate is None:
-                        item[f"unpriced_{side}_tokens"] += tokens
+                        priced[f"unpriced_{side}_tokens"] += tokens
                     else:
-                        item["equivalent_cny"] += tokens * rate / 1_000_000
+                        priced["equivalent_cny"] += tokens * rate / 1_000_000
+                daily_item = daily_groups.setdefault(key, {**empty, "day": key[0], "outcome": key[1]})
+                model_item = model_groups.setdefault((row["day"], row["model"]),
+                    {**empty, "day": row["day"], "model": row["model"]})
+                for item in (daily_item, model_item):
+                    for field in empty:
+                        item[field] += priced[field]
             daily = list(daily_groups.values())
             group_condition = "AND quota_group=?" if account else ""
             group_args = (time.time() - days * 86400, account["quota_group"]) if account else (time.time() - days * 86400,)
@@ -228,7 +234,8 @@ class Store:
                                     "window": window, "quota": values["quota"], "used": values["used"],
                                     "reset_time": values.get("reset_time"), "observed_at": row["quota_checked_at"],
                                     "quota_error": row["quota_error"]})
-            return {"daily": daily, "quota_history": history, "quota_current": current}
+            return {"daily": daily, "model_daily": list(model_groups.values()),
+                    "quota_history": history, "quota_current": current}
 
     def pricing(self) -> dict:
         return json.loads(self.setting("pricing", '{"default":{},"models":{}}'))

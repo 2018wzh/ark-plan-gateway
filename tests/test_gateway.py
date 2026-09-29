@@ -59,6 +59,29 @@ def test_pricing_model_override_default_and_missing_rate(store):
     assert row["unpriced_input_tokens"] == 0
 
 
+def test_model_daily_groups_accounts_and_outcomes_without_double_counting(store, monkeypatch):
+    first = store.add_account("agent", "first", models=["m", "n"])
+    second = store.add_account("coding", "second", models=["m"])
+    store.set_pricing({"default": {"input": 2}, "models": {"m": {"output": 4}}})
+    now = time.time()
+    monkeypatch.setattr("gateway.store.time.time", lambda: now - 86400)
+    store.record_request(first, "success", 10, "m", 100, 20)
+    monkeypatch.setattr("gateway.store.time.time", lambda: now)
+    store.record_request(first, "success", 10, "m", 200, 30)
+    store.record_request(first, "stream_error", 10, "m", 50, 5)
+    store.record_request(second, "success", 10, "m", 300, 40)
+    store.record_request(first, "success", 10, "n", 400, 60)
+    stats = store.statistics(None, 7)
+    rows = stats["model_daily"]
+    assert len(rows) == 3
+    today_m = next(row for row in rows if row["model"] == "m" and row["input_tokens"] == 550)
+    assert today_m["output_tokens"] == 75
+    assert today_m["equivalent_cny"] == pytest.approx(0.0014)
+    assert sum(row["input_tokens"] for row in rows) == sum(row["input_tokens"] for row in stats["daily"]) == 1050
+    assert sum(row["unpriced_output_tokens"] for row in rows) == 60
+    assert sum(row["input_tokens"] for row in store.statistics(first, 1)["model_daily"]) == 650
+
+
 def test_legacy_statistics_migrate_without_losing_tokens(tmp_path):
     path = str(tmp_path / "legacy.db")
     key = Fernet.generate_key().decode()
