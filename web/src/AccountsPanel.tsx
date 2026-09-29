@@ -1,11 +1,14 @@
-import {useRef,useState} from 'react';
+import {useEffect,useRef,useState} from 'react';
 import {Alert, Button, Card, Dropdown, Empty, Input, message, Modal, Progress, Select, Space, Statistic, Switch, Table, Tag, Tooltip, Typography} from 'antd';
 import {ClockCircleOutlined, MoreOutlined, SearchOutlined, TeamOutlined, CheckCircleOutlined, PauseCircleOutlined, ThunderboltOutlined} from '@ant-design/icons';
 import {api,errorText} from './api';
 import {Account,accountStatus,formatTime,quotaColor,remaining,StatusBadge,windowName} from './accounts';
 import GlobalStatus from './GlobalStatus';
+import {formatWait} from './cooldown';
 
 export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accounts:Account[],onEdit:(account:Account)=>void,reload:()=>Promise<void>,updatedAt:number|null}){
+  const [now,setNow]=useState(()=>Date.now()/1000);
+  useEffect(()=>{const timer=setInterval(()=>setNow(Date.now()/1000),1000);return()=>clearInterval(timer)},[]);
   const [query,setQuery]=useState(''),[plan,setPlan]=useState<string>(),[status,setStatus]=useState<string>();
   const [pending,setPending]=useState<string[]>([]);
   const running=useRef(new Set<string>());
@@ -30,7 +33,7 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
   const metrics=[{label:'全部账号',value:accounts.length,icon:<TeamOutlined/>},{label:'活跃账号',value:accounts.filter(a=>accountStatus(a).key==='active').length,icon:<CheckCircleOutlined/>,color:'#158f98'},{label:'冷却账号',value:accounts.filter(a=>accountStatus(a).key==='cooling').length,icon:<PauseCircleOutlined/>,color:'#d76542'},{label:'当前并发',value:accounts.reduce((n,a)=>n+(a.inflight||0),0),icon:<ThunderboltOutlined/>}];
   return <div className="page-stack">{context}{modalContext}
     <div className="metric-band">{metrics.map(metric=><Statistic key={metric.label} title={<Space>{metric.icon}{metric.label}</Space>} value={metric.value} valueStyle={{color:metric.color}}/>)}</div>
-    <GlobalStatus accounts={accounts}/>
+    <GlobalStatus accounts={accounts} now={now}/>
     <Card className="accounts-card" styles={{body:{padding:0}}}>
       <div className="table-toolbar"><Input prefix={<SearchOutlined/>} aria-label="搜索账号或模型" placeholder="搜索账号或模型" value={query} onChange={e=>setQuery(e.target.value)} allowClear className="account-search"/>
         <Select aria-label="套餐筛选" placeholder="全部套餐" allowClear value={plan} onChange={setPlan} options={[{value:'agent',label:'Agent Plan'},{value:'coding',label:'Coding Plan'}]}/>
@@ -44,12 +47,12 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
           {title:'可用额度',width:300,render:(_,a)=>Object.keys(a.usage).length?<div className="quota-rows">{Object.entries(a.usage).map(([name,usage])=>{
             const value=remaining(usage);
             return <div className="quota-row" key={name}>
-              <div className="quota-row-heading"><span>{windowName(name)}</span><span>{value===null?'未知':`${value.toFixed(1)}% 剩余`}</span></div>
-              <Progress aria-label={`${a.label} ${windowName(name)}剩余额度`} percent={value??0} showInfo={false} strokeColor={value===null?'#91a0a6':quotaColor(value)} size="small"/>
-              <div className="quota-row-meta"><span>{a.plan==='coding'?`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})}% 已用`:`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})} / ${usage.quota.toLocaleString()} AFP`}</span><Tooltip title={formatTime(usage.reset_time)}><span>{usage.reset_time&&usage.reset_time>0?`${new Date(usage.reset_time*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})} 重置`:'重置时间未知'}</span></Tooltip></div>
+              <Progress type="circle" size={58} strokeWidth={8} aria-label={`${a.label} ${windowName(name)}剩余额度`} percent={value??0} format={()=>value===null?'未知':`${value.toFixed(1)}%`} strokeColor={value===null?'#91a0a6':quotaColor(value)}/>
+              <div className="quota-row-body"><div className="quota-row-heading"><span>{windowName(name)}</span><span>剩余额度</span></div>
+              <div className="quota-row-meta"><span>{a.plan==='coding'?`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})}% 已用`:`${usage.used.toLocaleString('zh-CN',{maximumFractionDigits:1})} / ${usage.quota.toLocaleString()} AFP`}</span><Tooltip title={formatTime(usage.reset_time)}><span>{usage.reset_time&&usage.reset_time>0?`${new Date(usage.reset_time*1000).toLocaleString('zh-CN',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false})} 重置`:'重置时间未知'}</span></Tooltip></div></div>
             </div>;
           })}{a.quota_error&&<Typography.Text type="warning">查询失败，显示上次额度</Typography.Text>}</div>:<Typography.Text type="secondary">未知{!a.has_ak_sk?' · 未配置 AK/SK':''}</Typography.Text>},
-          {title:'状态',width:115,render:(_,a)=><div className="account-state"><StatusBadge account={a}/>{accountStatus(a).key==='cooling'&&<small>{a.cooldown_until?`至 ${new Date(a.cooldown_until*1000).toLocaleTimeString('zh-CN',{hour12:false})}`:'恢复时间未知'}</small>}</div>},
+          {title:'状态',width:115,render:(_,a)=><div className="account-state"><StatusBadge account={a}/>{accountStatus(a,now).key==='cooling'&&<small>{a.cooldown_until?`剩余 ${formatWait(a.cooldown_until,now)}`:'恢复时间未知'}</small>}</div>},
           {title:'操作',fixed:'right',width:165,render:(_,a)=><Space size={8}><Tooltip title={a.enabled?'停用账号':'启用账号'}><Switch size="small" aria-label={`${a.label} 启停`} checked={!!a.enabled} loading={pending.includes(a.id)} onChange={enabled=>act(a,'toggle',enabled)}/></Tooltip>
             <Button size="small" onClick={()=>onEdit(a)} disabled={pending.includes(a.id)}>编辑</Button>
             <Dropdown trigger={['click']} menu={{items:[{key:'refresh',label:'刷新额度'},{key:'resume',label:'手动恢复',disabled:!a.cooldown_kind&&!a.auth_failed}],onClick:({key})=>key==='refresh'?void act(a,'refresh'):modal.confirm({title:'恢复此额度主体？',content:'将清除同一额度主体的冷却和鉴权失败状态；下一次请求会重新尝试上游。',okText:'恢复',cancelText:'取消',onOk:()=>act(a,'resume')})}}><Button size="small" aria-label={`${a.label} 更多操作`} icon={<MoreOutlined/>} disabled={pending.includes(a.id)}/></Dropdown></Space>},

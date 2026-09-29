@@ -11,6 +11,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+from .pricing import price_usage, price_period
+
 
 class Store:
     def __init__(self, path: str, master_key: str):
@@ -52,16 +54,19 @@ class Store:
         """)
         if "model_mapping" not in {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}:
             self.db.execute("ALTER TABLE accounts ADD COLUMN model_mapping TEXT NOT NULL DEFAULT '{}'")
-        if "model" not in {r[1] for r in self.db.execute("PRAGMA table_info(request_daily)")}:
-            self.db.executescript("""
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(request_daily)")}
+        if "context_tokens" not in columns:
+            model_column = "model" if "model" in columns else "''"
+            self.db.executescript(f"""
             CREATE TABLE request_daily_new (
               day TEXT NOT NULL, account_id TEXT NOT NULL, model TEXT NOT NULL,
-              outcome TEXT NOT NULL, requests INTEGER NOT NULL DEFAULT 0,
-              input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
-              latency_ms INTEGER NOT NULL DEFAULT 0,
-              PRIMARY KEY (day, account_id, model, outcome)
+              outcome TEXT NOT NULL, context_tokens INTEGER NOT NULL, price_period INTEGER NOT NULL,
+              requests INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+              PRIMARY KEY (day, account_id, model, outcome, context_tokens, price_period)
             );
-            INSERT INTO request_daily_new SELECT day,account_id,'',outcome,requests,input_tokens,output_tokens,latency_ms FROM request_daily;
+            INSERT INTO request_daily_new
+              SELECT day,account_id,{model_column},outcome,-1,-1,requests,input_tokens,output_tokens,latency_ms FROM request_daily;
             DROP TABLE request_daily;
             ALTER TABLE request_daily_new RENAME TO request_daily;
             """)
@@ -152,18 +157,20 @@ class Store:
 
     def record_request(self, account_id: str, outcome: str, latency_ms: int,
                        model: str = "",
-                       input_tokens: int = 0, output_tokens: int = 0) -> None:
+                       input_tokens: int = 0, output_tokens: int = 0, requested_at: float | None = None,
+                       context_tokens: int | None = None) -> None:
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         with self.lock:
             self._prune_locked(now)
             self.db.execute("""INSERT INTO request_daily
-                (day,account_id,model,outcome,requests,input_tokens,output_tokens,latency_ms)
-                VALUES (?,?,?,?,1,?,?,?) ON CONFLICT(day,account_id,model,outcome) DO UPDATE SET
+                (day,account_id,model,outcome,context_tokens,price_period,requests,input_tokens,output_tokens,latency_ms)
+                VALUES (?,?,?,?,?,?,1,?,?,?) ON CONFLICT(day,account_id,model,outcome,context_tokens,price_period) DO UPDATE SET
                 requests=requests+1, input_tokens=input_tokens+excluded.input_tokens,
                 output_tokens=output_tokens+excluded.output_tokens,
                 latency_ms=latency_ms+excluded.latency_ms""",
-                (day, account_id, model, outcome, max(0, input_tokens), max(0, output_tokens), max(0, latency_ms)))
+                (day, account_id, model, outcome, max(0, input_tokens) if context_tokens is None else context_tokens,
+                 price_period(requested_at if requested_at is not None else now), max(0, input_tokens), max(0, output_tokens), max(0, latency_ms)))
             self.db.commit()
 
     def record_quota(self, quota_group: str, plan: str, usage: dict, observed_at: float) -> None:
@@ -192,7 +199,7 @@ class Store:
             pricing = self.pricing()
             daily_groups: dict[tuple[str, str], dict] = {}
             model_groups: dict[tuple[str, str], dict] = {}
-            for raw in self.db.execute(f"""SELECT day,model,outcome,requests,input_tokens,output_tokens,latency_ms
+            for raw in self.db.execute(f"""SELECT day,model,outcome,context_tokens,price_period,requests,input_tokens,output_tokens,latency_ms
                 FROM request_daily WHERE day>=?{condition} ORDER BY day DESC,outcome""", args):
                 row = dict(raw)
                 key = (row["day"], row["outcome"])
@@ -200,14 +207,7 @@ class Store:
                     "input_tokens": 0, "output_tokens": 0, "latency_ms": 0,
                     "equivalent_cny": 0.0, "unpriced_input_tokens": 0, "unpriced_output_tokens": 0}
                 priced = {**empty, **row}
-                rates = pricing["models"].get(row["model"], {})
-                for side in ("input", "output"):
-                    tokens = row[f"{side}_tokens"]
-                    rate = rates.get(side, pricing["default"].get(side))
-                    if rate is None:
-                        priced[f"unpriced_{side}_tokens"] += tokens
-                    else:
-                        priced["equivalent_cny"] += tokens * rate / 1_000_000
+                priced.update(price_usage(pricing, row["model"], row["context_tokens"], row["input_tokens"], row["output_tokens"], row["price_period"]))
                 daily_item = daily_groups.setdefault(key, {**empty, "day": key[0], "outcome": key[1]})
                 model_item = model_groups.setdefault((row["day"], row["model"]),
                     {**empty, "day": row["day"], "model": row["model"]})

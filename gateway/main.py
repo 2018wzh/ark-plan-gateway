@@ -17,7 +17,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
@@ -97,13 +97,35 @@ class Price(BaseModel):
     output: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
+class PriceTier(BaseModel):
+    max_input_tokens: int = Field(gt=0)
+    input: float = Field(ge=0, allow_inf_nan=False)
+    output: float = Field(ge=0, allow_inf_nan=False)
+
+
+class ModelPrice(Price):
+    tiers: list[PriceTier] = Field(default_factory=list, max_length=20)
+    peak: Price | None = None
+    note: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def valid_tiers(self):
+        if self.tiers:
+            bounds = [tier.max_input_tokens for tier in self.tiers]
+            if bounds != sorted(set(bounds)) or self.input is not None or self.output is not None or self.peak is not None:
+                raise ValueError("tiers require increasing unique bounds and no flat rates")
+        if self.peak is not None and any(rate is None for rate in (self.input, self.output, self.peak.input, self.peak.output)):
+            raise ValueError("peak pricing requires complete peak and off-peak prices")
+        return self
+
+
 class PricingIn(BaseModel):
     default: Price
-    models: dict[str, Price]
+    models: dict[str, ModelPrice]
 
     @field_validator("models")
     @classmethod
-    def valid_models(cls, value: dict[str, Price]) -> dict[str, Price]:
+    def valid_models(cls, value: dict[str, ModelPrice]) -> dict[str, ModelPrice]:
         if len(value) > 100 or any(not name.strip() or len(name) > 128 for name in value):
             raise ValueError("invalid model pricing")
         return value
@@ -347,10 +369,16 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             if not await pool.reserve(account):
                 continue
             started = time.monotonic()
+            started_at = time.time()
             def record(outcome: str, response_data: object = None):
                 if method == "POST":
                     inputs, outputs = token_usage(response_data)
-                    store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), model, inputs, outputs)
+                    usage = response_data.get("usage") if isinstance(response_data, dict) else None
+                    context = usage.get("input_tokens") if isinstance(usage, dict) else None
+                    context = context if isinstance(context, int) and not isinstance(context, bool) and context >= 0 else -1
+                    reported_model = response_data.get("model") if isinstance(response_data, dict) else None
+                    usage_model = reported_model if isinstance(reported_model, str) and 0 < len(reported_model) <= 128 else account["model_mapping"].get(model, model)
+                    store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), usage_model, inputs, outputs, started_at, context)
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
             headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json"}

@@ -22,7 +22,7 @@ const fmt = (value:number|null) => value ? new Date(value*1000).toLocaleString('
 const progress = (row:Quota) => {
   if(row.quota<=0)return '—';
   const used=Math.min(100,Math.max(0,row.used/row.quota*100));
-  return <Progress percent={100-used} size="small" strokeColor={quotaColor(100-used)} format={()=>`${(100-used).toFixed(1)}% 剩余`}/>;
+  return <span title="剩余额度"><Progress type="circle" percent={100-used} size={64} strokeWidth={8} strokeColor={quotaColor(100-used)} format={()=>`${(100-used).toFixed(1)}%`}/></span>;
 };
 
 export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) {
