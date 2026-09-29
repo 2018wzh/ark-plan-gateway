@@ -8,6 +8,41 @@ class ProtocolError(ValueError):
     pass
 
 
+def invalid_tool_arguments(data: dict, chat: bool) -> str | None:
+    """Validate complete function-call history, never partial streaming deltas."""
+    def reject_constant(value):
+        raise ValueError("non-finite JSON value")
+
+    def invalid(value):
+        if not isinstance(value, str):
+            return True
+        try:
+            json.loads(value, parse_constant=reject_constant)
+        except (ValueError, RecursionError):
+            return True
+        return False
+
+    entries = data.get("messages" if chat else "input")
+    if not isinstance(entries, list):
+        return None
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        if chat and entry.get("role") == "assistant":
+            calls = entry.get("tool_calls")
+            if not isinstance(calls, list):
+                continue
+            for call_index, call in enumerate(calls):
+                if not isinstance(call, dict) or call.get("type", "function") != "function":
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict) or invalid(function.get("arguments")):
+                    return f"messages[{index}].tool_calls[{call_index}].function.arguments"
+        elif not chat and entry.get("type") == "function_call" and invalid(entry.get("arguments")):
+            return f"input[{index}].arguments"
+    return None
+
+
 class SSEDecoder:
     """Incremental SSE parser; forwarding still uses the original byte chunks."""
 

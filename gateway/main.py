@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
-from .protocols import ProtocolError, SSEDecoder, StreamResult
+from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments
 from .errors import safe_error_code
 from .store import Store
 
@@ -45,7 +45,8 @@ def error_response(status: int, code: str, retry_at: float | None = None, exact:
                    details: dict | None = None) -> JSONResponse:
     metadata = {**(details or {}), "reset_time_known": retry_at is not None, "exact_pool_minimum": exact}
     headers = {}
-    message = code
+    message = {"invalid_tool_arguments": "Tool-call history contains invalid JSON arguments. Repair the failed tool turn before retrying; do not resend unchanged history.",
+               "upstream_request_rejected": "Upstream rejected the request parameters. Correct the request before retrying; switching accounts will not fix it."}.get(code, code)
     if retry_at is not None:
         seconds = max(1, int(retry_at - time.time() + 0.999))
         metadata.update(retry_after_seconds=seconds, retry_at=datetime.fromtimestamp(retry_at, timezone.utc).isoformat())
@@ -471,7 +472,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 if upstream.status_code >= 500:
                     gateway_code = "upstream_server_error"
                 return error_response(upstream.status_code if upstream.status_code < 500 else 502, gateway_code,
-                                      details={**last_error, "retryable": False})
+                                      details={**last_error, "retryable": False, "requires_request_change": kind == "request"})
             upstream_sse = upstream.headers.get("content-type", "").split(";", 1)[0].strip() == "text/event-stream"
             if not upstream_sse:
                 try:
@@ -509,10 +510,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         error = obj.get("error")
                         if not error and isinstance(response_obj, dict):
                             error = response_obj.get("error")
+                        if not error and obj.get("type") == "error":
+                            error = {"code": obj.get("code"), "message": obj.get("message")}
                         raw_error = json.dumps({"error": error}).encode()
                         kind, until = classify_error(500, raw_error, {}, time.time())
                         code = safe_error_code(raw_error)
-                        stream_error.update(upstream_code=code, category=kind, retryable=False)
+                        stream_error.update(upstream_code=code, category=kind, retryable=False, requires_request_change=kind == "request")
                         pool.update_result(account, kind, until, model, code)
 
             if not stream:
@@ -572,6 +575,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return error_response(400, "model_required")
         if "stream" in data and not isinstance(data["stream"], bool):
             return error_response(400, "stream_must_be_boolean")
+        invalid_arguments = invalid_tool_arguments(data, chat)
+        if invalid_arguments:
+            return error_response(400, "invalid_tool_arguments", details={"category": "request", "retryable": False,
+                                  "requires_request_change": True, "parameter": invalid_arguments})
         if chat:
             if not isinstance(data.get("messages"), list) or not data["messages"]:
                 return error_response(400, "messages_required")

@@ -44,6 +44,8 @@ def error_data(body: bytes) -> tuple[dict, dict]:
 def safe_error_code(body: bytes) -> str:
     _, error = error_data(body)
     code = error.get("code")
+    if isinstance(code, str) and code.startswith("InvalidParameter."):
+        return "InvalidParameter"
     return code if isinstance(code, str) and code in KNOWN_CODES else "UnknownUpstreamError"
 
 
@@ -106,7 +108,7 @@ def classify_error(status: int, body: bytes, headers: dict, now: float) -> tuple
                 "OperationDenied.FileQuotaExceeded", "OperationDenied.ArkAccessRoleNotFound",
                 "OperationDenied.TosAccessDenied", "QuotaExceeded.DoubaoSearchFreeQuotaExceeded"}:
         return "permission", None
-    if code in {"MissingParameter", "MissingHeader", "InvalidParameter", "RequestTooLarge", "RequestBodyTooLarge",
+    if code.startswith("InvalidParameter.") or code in {"MissingParameter", "MissingHeader", "InvalidParameter", "RequestTooLarge", "RequestBodyTooLarge",
                 "InputTextRiskDetection", "OutputTextRiskDetection", "PathNotFound"}:
         return "request", None
     if code in ACCOUNT_ERRORS:

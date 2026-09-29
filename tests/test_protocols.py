@@ -288,3 +288,115 @@ async def test_daily_quota_stream_error_cools_account_without_replay(setup, stre
     cooling = [a for a in store.accounts() if a['cooldown_kind'] == 'quota']
     assert len(cooling) == 1 and cooling[0]['cooldown_until'] == reset
     assert len(await app.state.pool.candidates('m')) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+@pytest.mark.parametrize('arguments', ['{"broken":', '', '{"number":NaN}', {'not': 'a string'}])
+async def test_invalid_tool_history_never_reaches_provider(setup, chat, arguments):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(400)
+    body = {'model': 'm'}
+    if chat:
+        body['messages'] = [{'role': 'assistant', 'tool_calls': [{'id': 'private-call', 'type': 'function', 'function': {'name': 'private-tool', 'arguments': arguments}}]}]
+    else:
+        body['input'] = [{'type': 'function_call', 'name': 'private-tool', 'call_id': 'private-call', 'arguments': arguments}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            for _ in range(2):
+                response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH, json=body)
+                assert response.status_code == 400
+                error = response.json()['error']
+                assert error['code'] == 'invalid_tool_arguments'
+                assert error['metadata']['retryable'] is False
+                assert error['metadata']['requires_request_change'] is True
+                assert 'arguments' in error['metadata']['parameter']
+                assert 'private-' not in response.text
+    assert calls == []
+    assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+async def test_provider_invalid_parameter_is_not_retried_or_cooled(setup, chat):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(400, json={'error': {'code': 'InvalidParameter', 'message': 'PRIVATE_PROVIDER_DETAIL'}})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            for expected in (1, 2):
+                response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH,
+                    json={'model':'m', 'input':'test', 'messages':[{'role':'user','content':'test'}]})
+                assert response.status_code == 400 and len(calls) == expected
+                assert response.json()['error']['metadata']['requires_request_change'] is True
+                assert response.json()['error']['metadata']['retryable'] is False
+                assert 'PRIVATE_PROVIDER_DETAIL' not in response.text
+    assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stream', [False, True])
+async def test_flat_stream_parameter_error_does_not_quarantine_model(setup, stream):
+    store, create_app = setup
+    aid = store.add_account('agent', 'a', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(200, stream=BytesStream(sse({'type':'error','code':'InvalidParameter.ToolArguments', 'message':'invalid arguments'})), headers={'content-type':'text/event-stream'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model':'m','input':'test','stream':stream})
+            assert response.status_code == (200 if stream else 502)
+            if not stream:
+                assert response.json()['error']['metadata']['upstream_code'] == 'InvalidParameter'
+                assert response.json()['error']['metadata']['requires_request_change'] is True
+    assert len(calls) == 1
+    assert store.account(aid)['model_blocks'] == []
+    assert store.account(aid)['cooldown_kind'] is None
+
+
+def test_valid_tool_history_is_not_rewritten():
+    from gateway.protocols import invalid_tool_arguments
+    arguments = '{"text":"你好", "nested":{"items":[1,2]}}'
+    chat = {'messages':[{'role':'assistant','tool_calls':[{'type':'function','function':{'name':'f','arguments':arguments}}]}]}
+    responses = {'input':[{'type':'function_call','arguments':arguments},{'type':'function_call_output','output':'plain text'}], 'previous_response_id':'resp_previous'}
+    before = json.dumps([chat,responses])
+    assert invalid_tool_arguments(chat, True) is None
+    assert invalid_tool_arguments(responses, False) is None
+    assert json.dumps([chat,responses]) == before
+
+
+def test_codex_custom_tool_and_server_context_are_not_json_validated():
+    from gateway.protocols import invalid_tool_arguments
+    data = {'previous_response_id': 'resp_previous', 'input': [
+        {'type': 'custom_tool_call', 'name': 'apply_patch', 'input': '*** Begin Patch'},
+        {'type': 'custom_tool_call_output', 'call_id': 'call_a', 'output': 'failed to parse'},
+        {'type': 'function_call_output', 'call_id': 'call_b', 'output': 'tool parse error'},
+    ]}
+    assert invalid_tool_arguments(data, False) is None
+
+
+@pytest.mark.asyncio
+async def test_responses_tool_argument_stream_is_forwarded_byte_for_byte(setup):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    payload = sse(
+        {'type':'response.function_call_arguments.delta','item_id':'fc_a','delta':'{"x":'},
+        {'type':'response.function_call_arguments.delta','item_id':'fc_a','delta':'1}'},
+        {'type':'response.function_call_arguments.done','item_id':'fc_a','arguments':'{"x":1}'},
+        {'type':'response.completed','response':{'id':'resp_a','status':'completed','output':[]}},
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: httpx.Response(200,stream=BytesStream(payload),headers={'content-type':'text/event-stream'}))) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store,remote)),base_url='http://test') as client:
+            result = await client.post('/v1/responses',headers=AUTH,json={'model':'m','input':'test','stream':True})
+            assert result.content == payload
