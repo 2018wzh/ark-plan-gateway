@@ -36,10 +36,34 @@ class Store:
           created_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS quota_snapshots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          observed_at REAL NOT NULL, quota_group TEXT NOT NULL, plan TEXT NOT NULL,
+          window TEXT NOT NULL, quota REAL NOT NULL, used REAL NOT NULL, reset_time REAL
+        );
+        CREATE INDEX IF NOT EXISTS quota_snapshots_scope_time
+          ON quota_snapshots (quota_group, window, observed_at DESC);
+        CREATE TABLE IF NOT EXISTS request_daily (
+          day TEXT NOT NULL, account_id TEXT NOT NULL, outcome TEXT NOT NULL,
+          requests INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER NOT NULL DEFAULT 0,
+          output_tokens INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (day, account_id, outcome)
+        );
         """)
         if "model_mapping" not in {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}:
             self.db.execute("ALTER TABLE accounts ADD COLUMN model_mapping TEXT NOT NULL DEFAULT '{}'")
+        self._last_pruned_day = ""
+        self._prune_locked(time.time())
         self.db.commit()
+
+    def _prune_locked(self, now: float) -> None:
+        today = time.strftime("%Y-%m-%d", time.gmtime(now))
+        if today == self._last_pruned_day:
+            return
+        self.db.execute("DELETE FROM quota_snapshots WHERE observed_at < ?", (now - 90 * 86400,))
+        self.db.execute("DELETE FROM request_daily WHERE day < ?",
+                        (time.strftime("%Y-%m-%d", time.gmtime(now - 90 * 86400)),))
+        self._last_pruned_day = today
 
     def _enc(self, value: str | None) -> str | None:
         return self.cipher.encrypt(value.encode()).decode() if value else None
@@ -113,6 +137,68 @@ class Store:
         with self.lock:
             self.db.execute("INSERT OR REPLACE INTO response_bindings VALUES (?,?,?)", (response_id, account_id, time.time()))
             self.db.commit()
+
+    def record_request(self, account_id: str, outcome: str, latency_ms: int,
+                       input_tokens: int = 0, output_tokens: int = 0) -> None:
+        now = time.time()
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        with self.lock:
+            self._prune_locked(now)
+            self.db.execute("""INSERT INTO request_daily
+                (day,account_id,outcome,requests,input_tokens,output_tokens,latency_ms)
+                VALUES (?,?,?,1,?,?,?) ON CONFLICT(day,account_id,outcome) DO UPDATE SET
+                requests=requests+1, input_tokens=input_tokens+excluded.input_tokens,
+                output_tokens=output_tokens+excluded.output_tokens,
+                latency_ms=latency_ms+excluded.latency_ms""",
+                (day, account_id, outcome, max(0, input_tokens), max(0, output_tokens), max(0, latency_ms)))
+            self.db.commit()
+
+    def record_quota(self, quota_group: str, plan: str, usage: dict, observed_at: float) -> None:
+        with self.lock:
+            self._prune_locked(observed_at)
+            for window, values in usage.items():
+                previous = self.db.execute("""SELECT observed_at,quota,used,reset_time FROM quota_snapshots
+                    WHERE quota_group=? AND window=? ORDER BY observed_at DESC LIMIT 1""",
+                    (quota_group, window)).fetchone()
+                current = (float(values["quota"]), float(values["used"]), values.get("reset_time"))
+                if previous and tuple(previous[k] for k in ("quota", "used", "reset_time")) == current and observed_at - previous["observed_at"] < 300:
+                    continue
+                self.db.execute("""INSERT INTO quota_snapshots
+                    (observed_at,quota_group,plan,window,quota,used,reset_time)
+                    VALUES (?,?,?,?,?,?,?)""", (observed_at, quota_group, plan, window, *current))
+            self.db.commit()
+
+    def statistics(self, account_id: str | None, days: int) -> dict:
+        since_day = time.strftime("%Y-%m-%d", time.gmtime(time.time() - (days - 1) * 86400))
+        with self.lock:
+            account = self.account(account_id) if account_id else None
+            if account_id and account is None:
+                raise KeyError(account_id)
+            condition = " AND account_id=?" if account_id else ""
+            args = (since_day, account_id) if account_id else (since_day,)
+            daily = [dict(row) for row in self.db.execute(f"""SELECT day,outcome,
+                SUM(requests) AS requests,SUM(input_tokens) AS input_tokens,
+                SUM(output_tokens) AS output_tokens,SUM(latency_ms) AS latency_ms
+                FROM request_daily WHERE day>=?{condition} GROUP BY day,outcome ORDER BY day DESC,outcome""", args)]
+            group_condition = "AND quota_group=?" if account else ""
+            group_args = (time.time() - days * 86400, account["quota_group"]) if account else (time.time() - days * 86400,)
+            history = [dict(row) for row in self.db.execute(f"""SELECT observed_at,quota_group,plan,window,quota,used,reset_time
+                FROM quota_snapshots WHERE observed_at>=? {group_condition} ORDER BY observed_at DESC LIMIT 200""", group_args)]
+            current = []
+            representatives = {}
+            for row in self.accounts():
+                if account and row["quota_group"] != account["quota_group"]:
+                    continue
+                previous = representatives.get(row["quota_group"])
+                if row["usage"] and (previous is None or (row["quota_checked_at"] or 0) > (previous["quota_checked_at"] or 0)):
+                    representatives[row["quota_group"]] = row
+            for row in representatives.values():
+                for window, values in row["usage"].items():
+                    current.append({"quota_group": row["quota_group"], "plan": row["plan"],
+                                    "window": window, "quota": values["quota"], "used": values["used"],
+                                    "reset_time": values.get("reset_time"), "observed_at": row["quota_checked_at"],
+                                    "quota_error": row["quota_error"]})
+            return {"daily": daily, "quota_history": history, "quota_current": current}
 
     def lookup_binding(self, response_id: str) -> str | None:
         with self.lock:

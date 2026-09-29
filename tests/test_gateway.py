@@ -23,6 +23,31 @@ def test_import_deduplicates_and_encrypts(store):
     assert "secret-value" not in (store.db.execute("SELECT api_key FROM accounts").fetchone()[0])
 
 
+def test_statistics_are_persistent_and_shared_quota_is_not_double_counted(tmp_path):
+    key = Fernet.generate_key().decode()
+    path = str(tmp_path / "statistics.db")
+    store = Store(path, key)
+    first = store.add_account("agent", "key-first", models=["m"])
+    second = store.add_account("agent", "key-second", models=["m"])
+    store.set_quota_group(second, first)
+    usage = {"five_hour": {"quota": 100, "used": 35, "reset_time": time.time() + 3600}}
+    for account_id in (first, second):
+        store.update(account_id, usage_json=json.dumps(usage), quota_checked_at=time.time())
+    store.record_quota(first, "agent", usage, time.time())
+    store.record_request(first, "success", 1200, 12, 3)
+    store.record_request(second, "rate", 80)
+    store.close()
+    store = Store(path, key)
+    all_stats = store.statistics(None, 7)
+    assert len(all_stats["quota_current"]) == 1
+    assert len(all_stats["quota_history"]) == 1
+    assert sum(row["requests"] for row in all_stats["daily"]) == 2
+    assert sum(row["input_tokens"] for row in all_stats["daily"]) == 12
+    assert sum(row["requests"] for row in store.statistics(first, 7)["daily"]) == 1
+    assert sum(row["requests"] for row in store.statistics(second, 7)["daily"]) == 1
+    store.close()
+
+
 @pytest.mark.asyncio
 async def test_cross_plan_selection_and_group_cooldown(store):
     a = store.add_account("agent", "key-agent", models=["m"])
@@ -97,6 +122,7 @@ async def test_afp_uses_latest_exhausted_window_reset(store, monkeypatch):
     result = store.account(a)
     assert result["cooldown_kind"] == "quota"
     assert 80 < result["cooldown_until"]-now < 100
+    assert len(store.statistics(a, 1)["quota_history"]) == 3
 
 
 @pytest.mark.asyncio
@@ -114,7 +140,8 @@ async def test_sync_failover_and_pinned_continuation(store, monkeypatch):
         calls.append((req.url.path, req.headers["authorization"], json.loads(req.content) if req.content else {}))
         if "key-agent" in req.headers["authorization"]:
             return httpx.Response(429, json={"error":{"code":"QuotaExceeded.AgentPlanQuotaExceeded"}})
-        return httpx.Response(200, json={"id":"resp_123", "object":"response", "model":"m", "output":[]})
+        return httpx.Response(200, json={"id":"resp_123", "object":"response", "model":"m", "output":[],
+                                         "usage":{"input_tokens":7,"output_tokens":2}})
     upstream_client = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
     app = create_app(store, upstream_client)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -123,6 +150,13 @@ async def test_sync_failover_and_pinned_continuation(store, monkeypatch):
         assert r.status_code == 200 and r.json()["id"] == "resp_123"
         assert len(calls) == 2 and calls[0][1] == "Bearer key-agent" and calls[1][1] == "Bearer key-coding"
         assert calls[1][2]["model"] == "actual-model"
+        outcomes = {row["outcome"]: row["requests"] for row in store.statistics(None, 1)["daily"]}
+        assert outcomes == {"quota": 1, "success": 1}
+        assert sum(row["input_tokens"] for row in store.statistics(None, 1)["daily"]) == 7
+        assert (await client.get("/api/statistics")).status_code == 401
+        assert (await client.post("/api/login", json={"password":"admin-password-123"})).status_code == 200
+        assert (await client.get("/api/statistics?days=1")).json()["daily"]
+        assert (await client.get("/api/statistics?days=91")).status_code == 400
         r = await client.post("/v1/responses", headers=headers, json={"model":"m", "previous_response_id":"resp_123", "input":"more"})
         assert r.status_code == 200 and calls[-1][1] == "Bearer key-coding"
     await upstream_client.aclose()

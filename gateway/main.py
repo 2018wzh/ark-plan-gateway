@@ -50,6 +50,16 @@ def error_response(status: int, code: str, retry_at: float | None = None, exact:
                                    "metadata": metadata}}, status_code=status, headers=headers)
 
 
+def token_usage(response: object) -> tuple[int, int]:
+    usage = response.get("usage") if isinstance(response, dict) else None
+    if not isinstance(usage, dict):
+        return 0, 0
+    def count(name: str) -> int:
+        value = usage.get(name)
+        return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+    return count("input_tokens"), count("output_tokens")
+
+
 class AccountIn(BaseModel):
     plan: str = Field(pattern="^(agent|coding)$")
     api_key: str = Field(min_length=5)
@@ -265,6 +275,16 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             a["cooldown_seconds"] = max(0, int(a["cooldown_until"] - now)) if a["cooldown_until"] else None
         return rows
 
+    @app.get("/api/statistics")
+    async def statistics(request: Request, account_id: str | None = None, days: int = 30):
+        require_admin(request)
+        if days < 1 or days > 90:
+            raise HTTPException(400, "days must be between 1 and 90")
+        try:
+            return store.statistics(account_id, days)
+        except KeyError:
+            raise HTTPException(404, "account not found")
+
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}
@@ -287,6 +307,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             attempted.add(account["id"])
             if not await pool.reserve(account):
                 continue
+            started = time.monotonic()
+            def record(outcome: str, response_data: object = None):
+                if method == "POST":
+                    inputs, outputs = token_usage(response_data)
+                    store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), inputs, outputs)
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
             headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json"}
@@ -302,11 +327,19 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
             except (httpx.TimeoutException, httpx.TransportError):
+                record("transport_error")
                 await pool.release(account)
                 return error_response(502, "upstream_transport_ambiguous")
             if upstream.status_code >= 400:
-                raw = await upstream.aread()
+                try:
+                    raw = await upstream.aread()
+                except (httpx.TimeoutException, httpx.TransportError):
+                    record("response_error")
+                    await upstream.aclose()
+                    await pool.release(account)
+                    return error_response(502, "upstream_response_failed")
                 kind, until = classify_error(upstream.status_code, raw, upstream.headers, time.time())
+                record(kind if kind != "other" else "rejected")
                 pool.update_result(account, kind, until)
                 await upstream.aclose()
                 await pool.release(account)
@@ -320,9 +353,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     data = json.loads(raw)
                     if isinstance(data, dict) and data.get("id"):
                         store.bind(data["id"], account["id"])
+                    record("success", data)
                     return Response(content=raw, status_code=upstream.status_code,
                                     media_type=upstream.headers.get("content-type", "application/json"))
-                except (httpx.TransportError, ValueError):
+                except (httpx.TimeoutException, httpx.TransportError, ValueError):
+                    record("response_error")
                     return error_response(502, "upstream_response_failed")
                 finally:
                     await upstream.aclose()
@@ -330,6 +365,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
 
             async def events():
                 buffer = b""
+                outcome = "client_disconnected"
+                latest_response = None
                 try:
                     async for chunk in upstream.aiter_raw():
                         buffer += chunk
@@ -340,20 +377,27 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                                 try:
                                     obj = json.loads(line[5:])
                                     response_obj = obj.get("response", {})
+                                    if isinstance(response_obj, dict) and response_obj.get("usage"):
+                                        latest_response = response_obj
                                     response_id = response_obj.get("id") or obj.get("id")
                                     if response_id and str(response_id).startswith("resp_"):
                                         store.bind(response_id, account["id"])
                                     if isinstance(obj.get("error"), dict):
                                         kind, until = classify_error(429, json.dumps(obj).encode(), {}, time.time())
+                                        outcome = kind if kind != "other" else "stream_error"
                                         if kind == "quota":
                                             pool.update_result(account, kind, until)
                                 except (ValueError, TypeError, AttributeError):
                                     pass
                         buffer = buffer.rsplit(b"\n", 1)[-1]
                         yield chunk
-                except httpx.TransportError:
+                    if outcome == "client_disconnected":
+                        outcome = "success"
+                except (httpx.TimeoutException, httpx.TransportError):
+                    outcome = "stream_error"
                     yield b"\nevent: error\ndata: {\"error\":{\"code\":\"upstream_stream_interrupted\"}}\n\n"
                 finally:
+                    record(outcome, latest_response)
                     await upstream.aclose()
                     await pool.release(account)
 

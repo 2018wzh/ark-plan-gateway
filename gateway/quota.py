@@ -53,6 +53,7 @@ async def refresh_account(store: Store, account: dict) -> None:
                               "reset_time": int(item["ResetTime"]) / 1000}
             if not usage:
                 raise RuntimeError("empty AFP usage")
+            store.record_quota(account["quota_group"], "agent", usage, now)
             exhausted = exhausted_windows(usage)
             until = max((x["reset_time"] for x in exhausted), default=None)
             for member in store.accounts():
