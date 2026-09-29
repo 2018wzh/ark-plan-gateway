@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import secrets
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -66,6 +67,8 @@ class AccountIn(BaseModel):
     label: str = Field(min_length=1, max_length=100)
     models: list[str] = Field(default_factory=lambda: ["ark-code-latest"])
     model_mapping: dict[str, str] = Field(default_factory=dict)
+    access_key: str | None = None
+    secret_key: str | None = None
 
 
 class AccountPatch(BaseModel):
@@ -223,9 +226,14 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         require_admin(request, True)
         if not body.models or any(k not in body.models or not v for k, v in body.model_mapping.items()):
             raise HTTPException(400, "model mapping must use configured model names")
+        if bool(body.access_key) != bool(body.secret_key):
+            raise HTTPException(400, "AK/SK must be provided together")
+        existing = {a["id"] for a in store.accounts()}
         account_id = store.add_account(body.plan, body.api_key, body.label, body.models)
-        if body.model_mapping:
-            store.update(account_id, model_mapping=body.model_mapping)
+        if account_id in existing:
+            raise HTTPException(409, "API key already exists")
+        store.update(account_id, model_mapping=body.model_mapping,
+                     access_key=body.access_key, secret_key=body.secret_key)
         return store.account(account_id)
 
     @app.patch("/api/accounts/{account_id}")
@@ -242,7 +250,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             raise HTTPException(400, "models required")
         if "model_mapping" in data and any(k not in (data.get("models") or store.account(account_id)["models"]) or not v for k,v in data["model_mapping"].items()):
             raise HTTPException(400, "model mapping must use configured model names")
-        store.update(account_id, **data)
+        try:
+            store.update(account_id, **data)
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "API key already exists")
         return store.account(account_id)
 
     @app.post("/api/accounts/{account_id}/refresh")

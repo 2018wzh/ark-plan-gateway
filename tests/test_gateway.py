@@ -272,3 +272,30 @@ async def test_stream_preserves_events(store, monkeypatch):
             assert r.status_code == 200 and b"".join(chunks) == payload
         assert store.lookup_binding("resp_stream")
     await upstream_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_account_editor_credentials_and_duplicate_keys(store, monkeypatch):
+    monkeypatch.setenv("ARK_GATEWAY_ADMIN_PASSWORD", "admin-password-123")
+    monkeypatch.setenv("ARK_GATEWAY_SERVICE_TOKEN", "service-token-123456789012345")
+    monkeypatch.setenv("ARK_GATEWAY_ALLOW_UNCONFIGURED", "1")
+    from gateway.main import create_app
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))) as upstream:
+        app = create_app(store, upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            await client.post("/api/login", json={"password":"admin-password-123"})
+            body = {"plan":"coding", "label":"first", "api_key":"test-first-key", "models":["m"], "access_key":"test-ak", "secret_key":"test-sk"}
+            response = await client.post("/api/accounts", json=body)
+            assert response.status_code == 200
+            account = response.json()
+            assert account["has_ak_sk"] is True
+            assert "test-ak" not in response.text and "test-sk" not in response.text and body["api_key"] not in response.text
+            assert store.account(account["id"], True)["access_key"] == "test-ak"
+            assert (await client.post("/api/accounts", json={**body, "label":"overwrite"})).status_code == 409
+            assert store.account(account["id"])["label"] == "first"
+            assert (await client.post("/api/accounts", json={**body, "api_key":"incomplete-key", "secret_key":None})).status_code == 400
+            assert len(store.accounts()) == 1
+            second = store.add_account("coding", "test-second-key", "second", ["m"])
+            assert (await client.patch(f"/api/accounts/{second}", json={"label":"changed", "api_key":body["api_key"]})).status_code == 409
+            assert store.account(second)["label"] == "second"
+            assert (await client.patch(f"/api/accounts/{second}", json={"label":"updated"})).status_code == 200

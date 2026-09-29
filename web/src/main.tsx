@@ -1,33 +1,83 @@
-import React, {lazy, Suspense, useEffect, useState} from 'react';
+import {lazy,Suspense,useCallback,useEffect,useRef,useState} from 'react';
 import {createRoot} from 'react-dom/client';
-import {Button, Card, ConfigProvider, Divider, Form, Input, InputNumber, Layout, Menu, message, Modal, Progress, Select, Space, Statistic, Switch, Table, Tag, Typography} from 'antd';
+import {Alert,Button,Card,ConfigProvider,Drawer,Form,Grid,Input,Layout,Menu,Modal,Space,Spin,Table,Typography} from 'antd';
+import {ApiOutlined,BarChartOutlined,DatabaseOutlined,DollarOutlined,LogoutOutlined,MenuOutlined,PlusOutlined,ReloadOutlined,SafetyCertificateOutlined,SettingOutlined,TeamOutlined} from '@ant-design/icons';
 import zhCN from 'antd/locale/zh_CN';
-const Statistics = lazy(()=>import('./Statistics'));
+import {api,ApiError,errorText} from './api';
+import {Account,StatusBadge} from './accounts';
+import AccountsPanel from './AccountsPanel';
+import AccountEditor from './AccountEditor';
 import Pricing from './Pricing';
+import SettingsPanel from './SettingsPanel';
 import './style.css';
 
-type Usage = Record<string,{quota:number,used:number,reset_time:number|null,unit?:string}>;
-type Account = {id:string,plan:string,label:string,api_key_mask:string,has_ak_sk:boolean,quota_group:string,models:string[],model_mapping:Record<string,string>,enabled:number,auth_failed:number,expired:number,cooldown_until:number|null,cooldown_kind:string|null,quota_checked_at:number|null,quota_error:string|null,usage:Usage,inflight?:number,cooldown_seconds?:number};
-async function api(path:string,method='GET',body?:unknown){const r=await fetch('/api'+path,{method,credentials:'same-origin',headers:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body)});if(!r.ok)throw new Error((await r.json()).detail||`${r.status}`);return r.json();}
-const fmt=(t:number|null|undefined)=>t?new Date(t*1000).toLocaleString('zh-CN'):'—';
-const quotaColor=(percent:number)=>percent>=85?'#cf3c3c':percent>=60?'#d99820':'#2f9e69';
-const quotaBar=(name:string,u:Usage[string])=>{const percent=u.quota>0?Math.min(100,Math.max(0,u.used/u.quota*100)):0;return <div key={name} style={{minWidth:210}}><div>{name} · {u.unit==='percent'?`${u.used.toFixed(1)}% 已用`:`${u.used} / ${u.quota}`}</div><Progress percent={percent} size="small" strokeColor={quotaColor(percent)} format={()=>`${Math.max(0,100-percent).toFixed(1)}% 剩余`}/><span className="muted">重置 {fmt(u.reset_time)}</span></div>};
-function App(){const [logged,setLogged]=useState(false),[password,setPassword]=useState(''),[tab,setTab]=useState('accounts'),[accounts,setAccounts]=useState<Account[]>([]),[settings,setSettings]=useState<{refresh_seconds:number}>({refresh_seconds:60}),[editing,setEditing]=useState<Account|null>(null),[addOpen,setAddOpen]=useState(false),[form]=Form.useForm(),[settingsForm]=Form.useForm(),[msg,contextHolder]=message.useMessage();
-  const load=async()=>{try{const [a,s]=await Promise.all([api('/routes'),api('/settings')]);setAccounts(a);setSettings(s);settingsForm.setFieldsValue(s);setLogged(true);}catch{setLogged(false)}};
-  useEffect(()=>{load()},[]);useEffect(()=>{if(!logged)return;const timer=setInterval(load,15000);return()=>clearInterval(timer)},[logged]);
-  const run=async(fn:()=>Promise<unknown>)=>{try{await fn();msg.success('已保存');await load()}catch(e){msg.error(String(e))}};
-  const isCooling=(a:Account)=>!!a.cooldown_kind&&(a.cooldown_until===null||a.cooldown_until>Date.now()/1000);
-  const status=(a:Account)=>!a.enabled?<Tag>已停用</Tag>:a.auth_failed?<Tag color="red">鉴权失败</Tag>:a.expired?<Tag color="red">套餐过期</Tag>:isCooling(a)&&a.cooldown_kind==='quota'?<Tag color="orange">额度冷却</Tag>:isCooling(a)&&a.cooldown_kind==='rate'?<Tag color="gold">限流退避</Tag>:<Tag color="green">活跃</Tag>;
-  if(!logged)return <ConfigProvider locale={zhCN}><div className="login"><Card title="Ark Plan Gateway" className="login-card"><Typography.Paragraph type="secondary">账号池管理</Typography.Paragraph><Input.Password placeholder="管理密码" value={password} onChange={e=>setPassword(e.target.value)} onPressEnter={()=>run(async()=>{await api('/login','POST',{password});setPassword('');await load()})}/><Button type="primary" block className="login-button" onClick={()=>run(async()=>{await api('/login','POST',{password});setPassword('');await load()})}>登录</Button></Card>{contextHolder}</div></ConfigProvider>;
-  const columns=[{title:'账号',dataIndex:'label',render:(_:unknown,a:Account)=><Space direction="vertical" size={0}><b>{a.label}</b><span className="muted">{a.api_key_mask}</span></Space>},{title:'套餐',dataIndex:'plan',render:(v:string)=>v==='agent'?'Agent Plan':'Coding Plan'},{title:'模型',dataIndex:'models',render:(v:string[])=>v.join(', ')},{title:'状态',render:(_:unknown,a:Account)=>status(a)},{title:'额度',render:(_:unknown,a:Account)=>Object.keys(a.usage).length?<Space direction="vertical" size={2}>{Object.entries(a.usage).map(([name,u])=>quotaBar(name,u))}</Space>:<span className="muted">未知{a.quota_error?` · ${a.quota_error}`:''}</span>},{title:'冷却',render:(_:unknown,a:Account)=>isCooling(a)&&a.cooldown_kind==='quota'?<Tag color="orange">冷却 · {a.cooldown_until?fmt(a.cooldown_until):'恢复时间未知'}</Tag>:isCooling(a)&&a.cooldown_kind==='rate'?<Tag color="gold">限流 · {fmt(a.cooldown_until)}</Tag>:a.enabled&&!a.auth_failed&&!a.expired?<Tag color="green">活跃</Tag>:'—'},{title:'操作',render:(_:unknown,a:Account)=><Space wrap><Button size="small" onClick={()=>{form.resetFields();setEditing(a);form.setFieldsValue({...a,models:a.models.join(','),model_mapping:Object.entries(a.model_mapping||{}).map(([k,v])=>`${k}=${v}`).join('\n')})}}>编辑</Button><Button size="small" onClick={()=>run(()=>api(`/accounts/${a.id}/refresh`,'POST'))}>刷新</Button><Button size="small" onClick={()=>run(()=>api(`/accounts/${a.id}/resume`,'POST'))}>恢复</Button><Switch size="small" checked={!!a.enabled} onChange={v=>run(()=>api(`/accounts/${a.id}`,'PATCH',{enabled:v}))}/></Space>}];
-  const saveAccount=(values:Record<string,unknown>)=>run(async()=>{const mappings=Object.fromEntries(String(values.model_mapping||'').split('\n').map(x=>x.trim()).filter(Boolean).map(x=>{const i=x.indexOf('=');if(i<1||i===x.length-1)throw new Error('模型映射格式应为 别名=上游模型');return [x.slice(0,i).trim(),x.slice(i+1).trim()]}));const body={...values,models:String(values.models||'ark-code-latest').split(',').map(x=>x.trim()).filter(Boolean),model_mapping:mappings};if(editing)await api(`/accounts/${editing.id}`,'PATCH',body);else await api('/accounts','POST',body);setEditing(null);setAddOpen(false);form.resetFields()});
-  return <ConfigProvider locale={zhCN}><Layout className="shell"><Layout.Sider breakpoint="lg" collapsedWidth="0" width={210} theme="light"><div className="brand">Ark Plan Gateway</div><Menu selectedKeys={[tab]} onClick={x=>setTab(x.key)} items={[{key:'accounts',label:'账号与额度'},{key:'statistics',label:'额度与统计'},{key:'pricing',label:'模型定价'},{key:'routes',label:'路由状态'},{key:'settings',label:'服务设置'}]}/></Layout.Sider><Layout.Content className="content"><div className="top"><div><Typography.Title level={3} style={{margin:0}}>{tab==='accounts'?'账号与额度':tab==='statistics'?'额度与统计':tab==='pricing'?'模型定价':tab==='routes'?'路由状态':'服务设置'}</Typography.Title><Typography.Text type="secondary">Agent Plan / Coding Plan · Responses 网关</Typography.Text></div><Button onClick={()=>run(()=>api('/logout','POST').then(()=>{setLogged(false);return Promise.resolve()}))}>退出</Button></div>
-    {tab==='accounts'&&<><div className="stats"><Card><Statistic title="账号" value={accounts.length}/></Card><Card><Statistic title="可用" value={accounts.filter(a=>a.enabled&&!a.auth_failed&&!a.expired&&!isCooling(a)).length}/></Card><Card><Statistic title="冷却" value={accounts.filter(a=>a.cooldown_kind==='quota'&&isCooling(a)).length}/></Card></div><Card title="账号" extra={<Button type="primary" onClick={()=>{setEditing(null);setAddOpen(true);form.resetFields()}}>添加账号</Button>}><Table rowKey="id" dataSource={accounts} columns={columns} scroll={{x:1200}} pagination={false}/></Card></>}
-    {tab==='routes'&&<Card title="模型与账号"><Table rowKey="id" pagination={false} dataSource={accounts} columns={[{title:'模型',dataIndex:'models',render:(v:string[])=>v.join(', ')},{title:'账号',dataIndex:'label'},{title:'模型映射',dataIndex:'model_mapping',render:(v:Record<string,string>)=>Object.entries(v||{}).map(([k,x])=>`${k} → ${x}`).join(', ')||'—'},{title:'状态',render:(_:unknown,a:Account)=>status(a)},{title:'并发',dataIndex:'inflight'},{title:'额度主体',dataIndex:'quota_group',render:(v:string)=><code>{v.slice(0,8)}</code>},{title:'冷却剩余',dataIndex:'cooldown_seconds',render:(v:number|null)=>v?`${v} 秒`:'—'}]}/></Card>}
-    {tab==='statistics'&&<Suspense fallback={<Card loading/>}><Statistics accounts={accounts} api={api}/></Suspense>}
-    {tab==='pricing'&&<Pricing api={api} models={[...new Set(accounts.flatMap(a=>a.models))]}/>}
-    {tab==='settings'&&<Card title="服务设置" className="settings"><Form form={settingsForm} layout="vertical" initialValues={settings} onFinish={v=>run(async()=>{await api('/settings','PATCH',v);settingsForm.setFieldsValue({new_password:'',new_service_token:''})})}><Form.Item name="refresh_seconds" label="额度刷新间隔（秒）"><InputNumber min={30} max={3600} style={{width:'100%'}}/></Form.Item><Form.Item name="new_password" label="更换管理密码"><Input.Password placeholder="留空则不修改，至少 12 位"/></Form.Item><Form.Item name="new_service_token" label="更换下游访问令牌"><Input.Password placeholder="留空则不修改，至少 24 位"/></Form.Item><Button type="primary" htmlType="submit">保存设置</Button></Form><Divider/><Typography.Text type="secondary">密钥只在提交时传输，不在界面回显。更换管理密码后需重新登录。</Typography.Text></Card>}
-    <Modal title={editing?'编辑账号':'添加账号'} open={!!editing||addOpen} onCancel={()=>{form.resetFields();setEditing(null);setAddOpen(false)}} onOk={()=>form.submit()} okText="保存"><Form form={form} layout="vertical" onFinish={saveAccount}><Form.Item name="label" label="名称" rules={[{required:true}]}><Input/></Form.Item>{!editing&&<Form.Item name="plan" label="套餐" rules={[{required:true}]}><Select options={[{value:'agent',label:'Agent Plan'},{value:'coding',label:'Coding Plan'}]}/></Form.Item>}<Form.Item name="api_key" label="API Key" rules={editing?[]:[{required:true}]}><Input.Password placeholder={editing?'留空不修改':''}/></Form.Item><Form.Item name="models" label="支持模型（逗号分隔）" rules={[{required:true}]}><Input/></Form.Item><Form.Item name="model_mapping" label="模型映射（每行 别名=上游模型）"><Input.TextArea rows={3} placeholder="不填写时原样转发"/></Form.Item>{editing&&<><Form.Item name="quota_group" label="额度主体账号 ID"><Select options={accounts.map(a=>({value:a.id,label:`${a.label} (${a.id.slice(0,8)})`}))}/></Form.Item><Form.Item name="access_key" label="Access Key"><Input.Password placeholder="留空不修改"/></Form.Item><Form.Item name="secret_key" label="Secret Key"><Input.Password placeholder="留空不修改"/></Form.Item></>}</Form></Modal>
-    {contextHolder}</Layout.Content></Layout></ConfigProvider>}
+const Statistics=lazy(()=>import('./Statistics'));
+const pages=[
+  {key:'accounts',label:'账号与额度',description:'管理套餐密钥、可用额度与账号状态',icon:<TeamOutlined/>},
+  {key:'statistics',label:'额度与统计',description:'按模型查看 Token 消耗与等效价格',icon:<BarChartOutlined/>},
+  {key:'pricing',label:'模型定价',description:'配置默认单价与各模型的专属价格',icon:<DollarOutlined/>},
+  {key:'routes',label:'路由状态',description:'查看模型映射、账号状态与当前并发',icon:<ApiOutlined/>},
+  {key:'settings',label:'服务设置',description:'管理额度刷新与访问凭据',icon:<SettingOutlined/>},
+];
+function Brand(){return <div className="brand"><DatabaseOutlined/><div><strong>Ark</strong><span>Plan Gateway</span></div></div>}
 
-createRoot(document.getElementById('root')!).render(<App/>);
+function App(){
+  const [logged,setLogged]=useState<boolean|null>(null),[loginBusy,setLoginBusy]=useState(false),[loginError,setLoginError]=useState('');
+  const [tab,setTab]=useState(()=>pages.some(p=>p.key===location.hash.slice(1))?location.hash.slice(1):'accounts');
+  const [accounts,setAccounts]=useState<Account[]>([]),[updatedAt,setUpdatedAt]=useState<number|null>(null),[loadError,setLoadError]=useState(''),[refreshing,setRefreshing]=useState(false);
+  const [editor,setEditor]=useState<Account|null|undefined>(),[mobileOpen,setMobileOpen]=useState(false),[dirty,setDirty]=useState(false);
+  const [modal,modalContext]=Modal.useModal();
+  const screens=Grid.useBreakpoint();
+  const loadingRequest=useRef<Promise<void>|null>(null);
+  const generation=useRef(0);
+  const load=useCallback(async()=>{
+    if(loadingRequest.current)return loadingRequest.current;
+    const current=generation.current;
+    setRefreshing(true);
+    const request=(async()=>{try{
+      const result=await api('/routes');
+      if(current!==generation.current)return;
+      setAccounts(result);setUpdatedAt(Date.now());setLoadError('');setLogged(true);
+    }catch(error){if(current!==generation.current)return;if(error instanceof ApiError&&error.status===401){setLogged(false);setLoadError('')}else setLoadError(errorText(error))}
+    finally{setRefreshing(false);loadingRequest.current=null}})();
+    loadingRequest.current=request;
+    return request;
+  },[]);
+  useEffect(()=>{void load()},[load]);
+  useEffect(()=>{if(!logged)return;const timer=setInterval(()=>{void load()},15000);return()=>clearInterval(timer)},[logged,load]);
+  useEffect(()=>{if(!dirty)return;const warn=(event:BeforeUnloadEvent)=>{event.preventDefault();event.returnValue=''};window.addEventListener('beforeunload',warn);return()=>window.removeEventListener('beforeunload',warn)},[dirty]);
+  const guard=(next:()=>void)=>{if(dirty)modal.confirm({title:'有未保存的修改',content:'离开后，本页尚未保存的修改将丢失。',okText:'放弃修改并离开',cancelText:'继续编辑',onOk:()=>{setDirty(false);next()}});else next()};
+  const navigate=(key:string)=>{if(key===tab){setMobileOpen(false);return}guard(()=>{setTab(key);history.replaceState(null,'',`#${key}`);setMobileOpen(false)})};
+  const logout=()=>guard(async()=>{try{await api('/logout','POST');generation.current++;setDirty(false);setEditor(undefined);setLogged(false);setLoginError('')}catch(error){setLoadError(errorText(error))}});
+  const page=pages.find(p=>p.key===tab)!;
+  const nav=<div className="nav-inner"><Brand/><Menu theme="dark" mode="inline" selectedKeys={[tab]} items={pages.map(({key,label,icon})=>({key,label,icon}))} onClick={({key})=>navigate(key)}/><div className="nav-footer"><span><SafetyCertificateOutlined/> 管理控制台</span><Button type="text" icon={<LogoutOutlined/>} onClick={logout}>退出登录</Button></div></div>;
+
+  if(logged===null)return <div className="startup"><Spin size="large"/><Typography.Text>正在连接管理控制台</Typography.Text>{loadError&&<Alert type="error" message={loadError} action={<Button onClick={load}>重试</Button>}/>}</div>;
+  if(!logged)return <div className="login"><div className="login-shell"><div className="login-brand"><Brand/><h1>账号与额度，<br/>一处管理。</h1><p>Agent Plan / Coding Plan</p><span>Responses 网关管理控制台</span></div><div className="login-form"><Typography.Title level={2}>登录控制台</Typography.Title><Typography.Paragraph type="secondary">使用管理密码访问账号池与用量统计。</Typography.Paragraph>{loginError&&<Alert className="inline-alert" showIcon type="error" message={loginError}/>}<Form layout="vertical" onFinish={async(values:{password:string})=>{if(loginBusy)return;setLoginBusy(true);setLoginError('');try{await api('/login','POST',values);await load()}catch(error){setLoginError(errorText(error))}finally{setLoginBusy(false)}}}><Form.Item name="password" label="管理密码" rules={[{required:true,message:'请输入管理密码'}]}><Input.Password autoComplete="current-password" size="large" placeholder="请输入管理密码"/></Form.Item><Button type="primary" htmlType="submit" size="large" block loading={loginBusy}>登录</Button></Form><div className="login-footnote"><SafetyCertificateOutlined/> 管理密码与下游访问令牌相互独立</div></div></div></div>;
+  return <Layout className="shell">{modalContext}
+    {screens.lg?<Layout.Sider className="desktop-nav" width={224}>{nav}</Layout.Sider>:<Drawer className="mobile-nav" placement="left" width={264} open={mobileOpen} onClose={()=>setMobileOpen(false)} closable title="导航" styles={{body:{padding:0}}}>{nav}</Drawer>}
+    <Layout.Content className="content">
+      <header className="top"><div className="page-title">{!screens.lg&&<Button className="nav-toggle" aria-label="打开导航" icon={<MenuOutlined/>} onClick={()=>setMobileOpen(true)}/>}<div><Typography.Title level={2}>{page.label}</Typography.Title><Typography.Text type="secondary">{page.description}</Typography.Text></div></div><Space className="page-actions">
+        {(tab==='accounts'||tab==='routes')&&<Button icon={<ReloadOutlined/>} loading={refreshing} onClick={load}>刷新列表</Button>}
+        {tab==='accounts'&&<Button type="primary" icon={<PlusOutlined/>} onClick={()=>setEditor(null)}>添加账号</Button>}
+      </Space></header>
+      {loadError&&<Alert className="inline-alert" type="warning" showIcon message="自动更新暂不可用，当前显示上次数据" description={loadError} action={<Button size="small" onClick={load}>重试</Button>}/>}
+      {tab==='accounts'&&<AccountsPanel accounts={accounts} onEdit={setEditor} reload={load} updatedAt={updatedAt}/>}
+      {tab==='statistics'&&<Suspense fallback={<Card loading/>}><Statistics accounts={accounts} api={api}/></Suspense>}
+      {tab==='pricing'&&<Pricing models={[...new Set(accounts.flatMap(a=>a.models))]} onDirty={setDirty}/>}
+      {tab==='settings'&&<SettingsPanel onDirty={setDirty} onPasswordChanged={()=>{generation.current++;setDirty(false);setLogged(false)}}/>}
+      {tab==='routes'&&<Card title="模型与账号"><Table<Account> rowKey="id" dataSource={accounts} pagination={false} scroll={{x:900}} columns={[
+        {title:'账号',dataIndex:'label',render:(_,a)=><Button type="link" onClick={()=>setEditor(a)}>{a.label}</Button>},
+        {title:'支持模型',dataIndex:'models',render:(models:string[])=>models.join('、')},
+        {title:'模型映射',dataIndex:'model_mapping',render:(value:Record<string,string>)=>Object.entries(value).map(([key,value])=>`${key} → ${value}`).join('、')||'原样转发'},
+        {title:'状态',render:(_,a)=><StatusBadge account={a}/>},
+        {title:'当前并发',dataIndex:'inflight'},
+        {title:'共享额度主体',dataIndex:'quota_group',render:(id:string)=>accounts.find(a=>a.id===id)?.label||'未找到'},
+      ]}/></Card>}
+      <footer className="app-footer">Ark Plan Gateway <span>Agent Plan / Coding Plan</span></footer>
+    </Layout.Content>
+    {editor!==undefined&&<AccountEditor account={editor} accounts={accounts} onClose={()=>setEditor(undefined)} onSaved={()=>{setEditor(undefined);void load()}}/>}
+  </Layout>;
+}
+
+createRoot(document.getElementById('root')!).render(<ConfigProvider locale={zhCN} theme={{token:{colorPrimary:'#158f98',colorInfo:'#158f98',colorSuccess:'#16a085',colorWarning:'#c28a26',colorText:'#18343d',colorTextSecondary:'#6d8088',colorBorder:'#dce5e9',colorBgLayout:'#f4f7f8',borderRadius:10,fontFamily:'Inter, "Segoe UI", "Microsoft YaHei", sans-serif',fontSize:14,controlHeight:38},components:{Menu:{darkItemBg:'#142c35',darkSubMenuItemBg:'#142c35',darkItemSelectedBg:'#215562',darkItemSelectedColor:'#fff',itemHeight:48},Table:{headerBg:'#f6f9fa',headerColor:'#637780',rowHoverBg:'#f5fbfb'},Card:{headerFontSize:16},Button:{primaryShadow:'none'}}}}><App/></ConfigProvider>);

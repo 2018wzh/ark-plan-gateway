@@ -129,7 +129,7 @@ class Store:
             data["models"] = json.dumps(data["models"])
         if "model_mapping" in data:
             data["model_mapping"] = json.dumps(data["model_mapping"])
-        with self.lock:
+        with self.lock, self.db:
             if data:
                 self.db.execute("UPDATE accounts SET " + ", ".join(f"{k}=?" for k in data) + " WHERE id=?",
                                 (*data.values(), account_id))
@@ -141,7 +141,6 @@ class Store:
                         self.db.execute("UPDATE accounts SET api_key=?,key_hash=? WHERE id=?", (self._enc(value), digest, account_id))
                     else:
                         self.db.execute(f"UPDATE accounts SET {k}=? WHERE id=?", (self._enc(value), account_id))
-            self.db.commit()
 
     def set_quota_group(self, account_id: str, group_id: str) -> None:
         self.update(account_id, quota_group=group_id)

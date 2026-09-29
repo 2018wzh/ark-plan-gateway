@@ -24,6 +24,12 @@ docker compose up -d --build
 
 单实例运行，持久卷为 `./data`。若从 GHCR 拉取已发布镜像，先运行 `docker pull ghcr.io/2018wzh/ark-plan-gateway:latest`，再运行 `docker compose up -d --no-build`。公开服务时须通过反向代理启用 HTTPS，并设置可信访问控制。
 
+## 管理界面
+
+账号页支持按名称、模型、套餐和状态筛选，展开账号查看各限制窗口。新增账号可同时填写 AK/SK；编辑时密钥留空表示不修改。刷新额度和手动恢复位于每行的更多操作菜单。
+
+统计页展示模型 Token 消耗与等效价格；模型定价和服务设置均需点击保存，离开有未保存修改的页面时会提醒。账号列表后台更新不会覆盖正在填写的表单，网络暂时失败时保留当前数据并提示重试。窄屏通过左上角菜单切换页面。
+
 ## New API 接入
 
 在 New API 建立普通 **OpenAI Responses** 渠道：Base URL 设为网关地址（不要附加 `/v1`），Key 填 `ARK_GATEWAY_SERVICE_TOKEN`，模型配置为两类套餐共同支持的模型名，如 `ark-code-latest`。关闭该渠道自动禁用，避免账号池的额度错误禁用整条渠道；将额度错误配置为停止 New API 的重复重试。网关内部已对候选账号做一次安全切换。

@@ -1,4 +1,6 @@
 import {useEffect, useState} from 'react';
+import {errorText} from './api';
+import {quotaColor} from './accounts';
 import {Alert, Card, Collapse, Empty, Progress, Select, Space, Statistic, Table, Typography} from 'antd';
 import {DollarOutlined, DownloadOutlined, BarChartOutlined, UploadOutlined} from '@ant-design/icons';
 import {Bar, BarChart, CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis} from 'recharts';
@@ -20,7 +22,7 @@ const fmt = (value:number|null) => value ? new Date(value*1000).toLocaleString('
 const progress = (row:Quota) => {
   if(row.quota<=0)return '—';
   const used=Math.min(100,Math.max(0,row.used/row.quota*100));
-  return <Progress percent={used} size="small" strokeColor={used>=85?'#cf3c3c':used>=60?'#d99820':'#2f9e69'} format={()=>`${(100-used).toFixed(1)}% 剩余`}/>;
+  return <Progress percent={100-used} size="small" strokeColor={quotaColor(100-used)} format={()=>`${(100-used).toFixed(1)}% 剩余`}/>;
 };
 
 export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) {
@@ -35,7 +37,7 @@ export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) 
     setLoading(true);
     const load = () => api(`/statistics?days=${days}${accountId?`&account_id=${encodeURIComponent(accountId)}`:''}`)
       .then(value => {if(alive){setData(value);setError('')}})
-      .catch(reason => {if(alive)setError(String(reason))})
+      .catch(reason => {if(alive)setError(errorText(reason))})
       .finally(()=>{if(alive)setLoading(false)});
     load();
     const timer = setInterval(load,15000);
@@ -86,8 +88,8 @@ export default function Statistics({accounts,api}:{accounts:Account[],api:Api}) 
           <BarChart data={trend} margin={{top:12,right:12,left:0,bottom:0}}>
             <CartesianGrid strokeDasharray="3 3" vertical={false}/><XAxis dataKey="day" tickFormatter={v=>v.slice(5)} minTickGap={24}/><YAxis tickFormatter={compact} width={58}/>
             <Tooltip formatter={(v)=>number(Number(v))}/><Legend/>
-            <Bar dataKey="input_tokens" name="输入 Token" stackId="tokens" fill="#3b6fe8" isAnimationActive={false}/>
-            <Bar dataKey="output_tokens" name="输出 Token" stackId="tokens" fill="#42b7a1" isAnimationActive={false}/>
+            <Bar dataKey="input_tokens" name="输入 Token" stackId="tokens" fill="#158f98" isAnimationActive={false}/>
+            <Bar dataKey="output_tokens" name="输出 Token" stackId="tokens" fill="#9bc9d1" isAnimationActive={false}/>
           </BarChart>
         </ResponsiveContainer></div>:<div className="usage-chart-empty"><Empty description="暂无已报告的 Token 消耗"/></div>}
       </Card>
