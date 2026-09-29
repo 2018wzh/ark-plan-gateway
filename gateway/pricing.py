@@ -3,6 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 
+# Only confirmed upstream identities belong here; never infer a price from a
+# shared prefix or strip arbitrary version suffixes (for example from `auto`).
+MODEL_PRICE_ALIASES = {
+    "doubao-seed-2-1-turbo-260628": "doubao-seed-2.1-turbo",
+}
+
+
 def price_period(timestamp: float) -> int:
     local = datetime.fromtimestamp(timestamp, timezone(timedelta(hours=8)))
     return int(local.weekday() < 5 and (9 <= local.hour < 12 or 14 <= local.hour < 18))
@@ -10,7 +17,10 @@ def price_period(timestamp: float) -> int:
 
 def price_usage(pricing: dict, model: str, context_tokens: int, inputs: int, outputs: int, period: int = -1) -> dict:
     result = {"equivalent_cny": 0.0, "unpriced_input_tokens": 0, "unpriced_output_tokens": 0}
-    configured = pricing["models"].get(model, {})
+    models = pricing["models"]
+    # An explicit version-specific configuration always takes precedence.
+    price_model = model if model in models else MODEL_PRICE_ALIASES.get(model, model)
+    configured = models.get(price_model, {})
     tiers = configured.get("tiers", [])
     if configured.get("peak"):
         rates = configured["peak"] if period == 1 else configured if period == 0 else {}

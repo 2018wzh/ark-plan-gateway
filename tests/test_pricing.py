@@ -17,6 +17,45 @@ TIERS = [{"max_input_tokens": 32000, "input": 3.2, "output": 16},
 PRICING = {"default": {"input": 1, "output": 2}, "models": {"m": {"tiers": TIERS}}}
 
 
+def test_confirmed_version_alias_and_explicit_override():
+    config = {"default": {}, "models": {"doubao-seed-2.1-turbo": {"input": 3, "output": 15}}}
+    version = "doubao-seed-2-1-turbo-260628"
+    assert price_usage(config, version, 100, 100, 63) == {
+        "equivalent_cny": pytest.approx(.001245),
+        "unpriced_input_tokens": 0, "unpriced_output_tokens": 0}
+    config["models"][version] = {"input": 4, "output": 20}
+    assert price_usage(config, version, 100, 100, 63)["equivalent_cny"] == pytest.approx(.00166)
+    config["models"][version] = {}
+    assert price_usage(config, version, 100, 100, 63)["unpriced_input_tokens"] == 100
+
+
+@pytest.mark.parametrize("model", ["auto", "ark-code-latest", "doubao-seed-2-1-turbo-999999", "doubao-seed-2-1-pro-260628"])
+def test_unknown_model_identity_is_not_guessed(model):
+    config = {"default": {}, "models": {"doubao-seed-2.1-turbo": {"input": 3, "output": 15}}}
+    assert price_usage(config, model, 100, 100, 63) == {
+        "equivalent_cny": 0, "unpriced_input_tokens": 100, "unpriced_output_tokens": 63}
+
+
+def test_existing_version_statistics_repriced_without_changing_identity(tmp_path):
+    path = str(tmp_path / "alias.db")
+    key = Fernet.generate_key().decode()
+    store = Store(path, key)
+    account = store.add_account("agent", "test-key")
+    store.record_request(account, "success", 10, "doubao-seed-2-1-turbo-260628", 50, 34)
+    store.record_request(account, "success", 10, "doubao-seed-2-1-turbo-260628", 50, 29)
+    store.close()
+    store = Store(path, key)
+    store.set_pricing({"default": {}, "models": {"doubao-seed-2.1-turbo": {"input": 3, "output": 15}}})
+    stats = store.statistics(None, 1)
+    row = stats["model_daily"][0]
+    assert row["model"] == "doubao-seed-2-1-turbo-260628"
+    assert row["requests"] == 2
+    assert row["equivalent_cny"] == pytest.approx(.001245)
+    assert row["unpriced_input_tokens"] == row["unpriced_output_tokens"] == 0
+    assert stats["daily"][0]["equivalent_cny"] == pytest.approx(.001245)
+    store.close()
+
+
 @pytest.mark.parametrize("length,rate", [(32000,3.2),(32001,4.8),(128000,4.8),(128001,9.6),(256000,9.6)])
 def test_context_tier_boundaries(length, rate):
     result = price_usage(PRICING, "m", length, length, 0)
@@ -86,7 +125,8 @@ def test_catalog_and_invalid_tier_configuration(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stream", [False, True])
-async def test_proxy_prices_reported_model_and_full_context(tmp_path, monkeypatch, stream):
+@pytest.mark.parametrize("reported_model,price_model", [("m", "m"), ("doubao-seed-2-1-turbo-260628", "doubao-seed-2.1-turbo")])
+async def test_proxy_prices_reported_model_and_full_context(tmp_path, monkeypatch, stream, reported_model, price_model):
     import httpx
     monkeypatch.setenv('ARK_GATEWAY_ALLOW_UNCONFIGURED','1')
     monkeypatch.setenv('ARK_GATEWAY_ADMIN_PASSWORD','admin-password-123')
@@ -94,8 +134,8 @@ async def test_proxy_prices_reported_model_and_full_context(tmp_path, monkeypatc
     from gateway.main import create_app
     store=Store(str(tmp_path/'proxy.db'),Fernet.generate_key().decode())
     store.add_account('coding','test-key',models=['ark-code-latest'])
-    store.set_pricing(PRICING)
-    response={"id":"resp_tier","model":"m","usage":{"input_tokens":32001,"output_tokens":1000}}
+    store.set_pricing({"default": {}, "models": {price_model: {"tiers": TIERS}}})
+    response={"id":"resp_tier","model":reported_model,"usage":{"input_tokens":32001,"output_tokens":1000}}
     class Events(httpx.AsyncByteStream):
         async def __aiter__(self):
             yield ('event: response.completed\ndata: '+json.dumps({'response':response})+'\n\n').encode()
@@ -107,6 +147,6 @@ async def test_proxy_prices_reported_model_and_full_context(tmp_path, monkeypatc
             result=await client.post('/v1/responses',headers={'authorization':'Bearer service-token-123456789012345'},json={'model':'ark-code-latest','input':'test','stream':stream})
             assert result.status_code == 200
     row=store.statistics(None,1)['model_daily'][0]
-    assert row['model'] == 'm'
+    assert row['model'] == reported_model
     assert row['equivalent_cny'] == pytest.approx((32001*4.8+1000*24)/1_000_000)
     store.close()
