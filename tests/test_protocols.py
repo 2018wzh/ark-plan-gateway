@@ -204,6 +204,111 @@ def test_sse_multiline_event_and_utf8_boundaries():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+@pytest.mark.parametrize('stream', [False, True])
+@pytest.mark.parametrize('failure', [500, 502, 503, 504, httpx.ConnectError, httpx.ConnectTimeout])
+async def test_transient_failure_switches_before_successful_generation(setup, chat, stream, failure):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    terminal = {'id': 'resp_recovered', 'status': 'completed', 'output': [], 'model': 'm'}
+    payload = sse(*chat_events()) if chat else sse({'type': 'response.completed', 'response': terminal})
+    source = BytesStream(payload)
+    rejected = BytesStream(b'{"error":{"code":"InternalServiceError"}}')
+    calls = []
+
+    def upstream(request):
+        calls.append(request)
+        if len(calls) == 1:
+            if isinstance(failure, int):
+                return httpx.Response(failure, stream=rejected, headers={'retry-after': '600'})
+            raise failure('connection failed', request=request)
+        return httpx.Response(200, stream=source, headers={'content-type': 'text/event-stream'})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            path = '/v1/chat/completions' if chat else '/v1/responses'
+            body = {'model': 'm', 'stream': stream, 'input': 'test', 'messages': [{'role': 'user', 'content': 'test'}]}
+            response = await client.post(path, headers=AUTH, json=body)
+            assert response.status_code == 200
+            if stream:
+                assert response.content == payload
+            else:
+                assert response.json()['id'] == ('chatcmpl_test' if chat else 'resp_recovered')
+    assert len(calls) == 2
+    assert calls[0].headers['authorization'] != calls[1].headers['authorization']
+    assert source.closed
+    if isinstance(failure, int):
+        assert rejected.closed
+        blocked = [a for a in store.accounts() if a['model_blocks']]
+        assert len(blocked) == 1 and blocked[0]['model_blocks'][0]['retry_at'] >= time.time() + 590
+    assert all(n == 0 for n in app.state.pool.inflight.values())
+    assert not app.state.pool.probing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('accounts,pinned,expected_calls', [(1, False, 1), (2, False, 2), (5, False, 3), (5, True, 1)])
+@pytest.mark.parametrize('failure', [503, httpx.ConnectTimeout])
+async def test_transient_failover_exhaustion_and_response_binding(setup, accounts, pinned, expected_calls, failure):
+    store, create_app = setup
+    ids = [store.add_account('agent', f'key-{i}', models=['m']) for i in range(accounts)]
+    store.bind('resp_previous', ids[0])
+    calls = []
+
+    def upstream(request):
+        calls.append(request)
+        if isinstance(failure, int):
+            return httpx.Response(failure, json={'error': {'code': 'InternalServiceError'}}, headers={'retry-after': '600'})
+        raise failure('connect timeout', request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            body = {'model': 'm', 'input': 'test'}
+            if pinned:
+                body['previous_response_id'] = 'resp_previous'
+            response = await client.post('/v1/responses', headers=AUTH, json=body)
+            assert response.status_code == 503
+            code = 'upstream_failover_exhausted' if accounts == 5 and not pinned else 'upstream_unavailable'
+            assert response.json()['error']['code'] == code
+            assert response.json()['error']['metadata']['retryable'] is True
+            if code == 'upstream_unavailable':
+                assert int(response.headers['retry-after']) > 0
+    assert len(calls) == expected_calls
+    assert len({r.headers['authorization'] for r in calls}) == expected_calls
+    if pinned:
+        assert calls[0].headers['authorization'] == 'Bearer key-0'
+    assert sum(bool(a['model_blocks']) for a in store.accounts()) == expected_calls
+    assert all(n == 0 for n in app.state.pool.inflight.values())
+    assert not app.state.pool.probing
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', [httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError, httpx.PoolTimeout])
+async def test_ambiguous_send_not_replayed_and_pool_timeout_not_quarantined(setup, failure):
+    store, create_app = setup
+    for key in ('a', 'b'):
+        store.add_account('agent', key, models=['m'])
+    calls = []
+
+    def upstream(request):
+        calls.append(request)
+        raise failure('test failure', request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model': 'm', 'input': 'test'})
+            busy = failure is httpx.PoolTimeout
+            assert response.status_code == (503 if busy else 502)
+            assert response.json()['error']['metadata']['retryable'] is busy
+    assert len(calls) == 1
+    assert sum(bool(a['model_blocks']) for a in store.accounts()) == (0 if busy else 1)
+    assert all(n == 0 for n in app.state.pool.inflight.values())
+
+
+@pytest.mark.asyncio
 async def test_chat_switches_only_after_explicit_rejection(setup):
     store, create_app = setup
     store.add_account('agent', 'a', models=['m'])

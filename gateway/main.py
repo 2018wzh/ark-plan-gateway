@@ -28,6 +28,8 @@ from .store import Store
 
 AGENT_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 CODING_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
+TRANSIENT_HTTP_STATUSES = {500, 502, 503, 504}
+MAX_TRANSIENT_FAILURES = 3
 
 
 def password_hash(password: str, salt: str | None = None) -> str:
@@ -373,6 +375,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         chat = path == "/chat/completions"
         attempted: set[str] = set()
         last_error: dict = {}
+        transient_failures = 0
         while True:
             candidates = await pool.candidates(model, pinned, attempted)
             if not candidates:
@@ -389,6 +392,9 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 return error_response(status, code, retry_at, exact,
                                       {**last_error, "blocking_codes": sorted(reasons), "retryable": retry_at is not None,
                                        "requires_admin": retry_at is None})
+            if transient_failures >= MAX_TRANSIENT_FAILURES:
+                return error_response(503, "upstream_failover_exhausted",
+                                      details={**last_error, "retryable": True, "requires_admin": False})
             account = candidates[0]
             attempted.add(account["id"])
             if not await pool.reserve(account, model):
@@ -426,6 +432,22 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     account_body = json.dumps(account_json, ensure_ascii=False).encode()
                 req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                record("connection_error")
+                last_error = {"category": "transport"}
+                if method == "POST":
+                    pool.update_result(account, "server", None, model)
+                with anyio.CancelScope(shield=True):
+                    await pool.release(account)
+                if method == "POST":
+                    transient_failures += 1
+                    continue
+                return error_response(502, "upstream_connection_failed", details={**last_error, "retryable": True})
+            except httpx.PoolTimeout:
+                record("connection_pool_busy")
+                with anyio.CancelScope(shield=True):
+                    await pool.release(account)
+                return error_response(503, "gateway_connection_pool_busy", details={"retryable": True})
             except (httpx.TimeoutException, httpx.TransportError):
                 record("transport_error")
                 if method == "POST":
@@ -465,6 +487,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 if method == "POST" or kind in ("quota", "rate", "auth", "account"):
                     pool.update_result(account, kind, until, model, code)
                 await close_upstream()
+                # A 5xx can still mean the upstream did work; this favors availability.
+                if method == "POST" and upstream.status_code in TRANSIENT_HTTP_STATUSES and kind in ("server", "overload"):
+                    transient_failures += 1
+                    continue
                 if kind in ("quota", "rate", "model_rate", "auth", "account", "model", "model_limit", "overload") and method == "POST" and upstream.status_code < 500:
                     continue
                 gateway_code = {"permission": "upstream_permission_denied", "request": "upstream_request_rejected",

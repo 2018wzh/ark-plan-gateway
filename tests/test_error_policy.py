@@ -168,8 +168,9 @@ def test_concurrent_failure_snapshots_do_not_reset_backoff(store):
 @pytest.mark.parametrize('status,code,expected_calls,expected_status', [
     (403, 'AccessDenied', 1, 403), (403, 'OperationDenied.ServiceNotOpen', 2, 200),
     (429, 'InflightBatchsizeExceeded', 2, 200), (429, 'UnknownCode', 2, 200),
-    (404, 'UnsupportedModel', 2, 200), (500, 'InternalServiceError', 1, 502),
-    (503, 'ServerOverloaded', 1, 502), (401, 'MCPInvalidCredential', 1, 401),
+    (404, 'UnsupportedModel', 2, 200), (500, 'InternalServiceError', 2, 200),
+    (503, 'ServerOverloaded', 2, 200), (401, 'MCPInvalidCredential', 1, 401),
+    (501, 'InternalServiceError', 1, 502), (503, 'InvalidParameter', 1, 502),
 ])
 async def test_http_policy_and_metadata(store, monkeypatch, status, code, expected_calls, expected_status):
     monkeypatch.setenv('ARK_GATEWAY_ALLOW_UNCONFIGURED', '1')
