@@ -62,6 +62,28 @@ def setup(tmp_path, monkeypatch):
     store.close()
 
 
+@pytest.mark.parametrize('stream_error', [False, True])
+def test_websocket_upstream_errors_preserve_payload(setup, stream_error):
+    store, create = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    calls = []
+    payload = {'error': {'code': 'MissingParameter', 'message': 'Missing input', 'param': 'input', 'type': 'invalid_request_error'}}
+    event = {'type': 'error', 'code': 'MissingParameter', 'message': 'Missing input', 'param': 'input'}
+    def upstream(request):
+        calls.append(request)
+        if stream_error:
+            return httpx.Response(200, stream=EventStream([event]), headers={'content-type': 'text/event-stream'})
+        return httpx.Response(400, json=payload)
+    _, client = create(upstream)
+    with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
+        for _ in range(2):
+            ws.send_json({'type':'response.create', 'model':'m', 'input':'test'})
+            assert ws.receive_json() == (event if stream_error else {'type':'error', 'status':400, **payload})
+    assert len(calls) == 2
+    assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
+
+
 def test_websocket_authentication_before_upgrade(setup):
     store, create = setup
     calls = []

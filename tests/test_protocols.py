@@ -145,7 +145,8 @@ async def test_models_list_and_validation(setup):
                                          json={"model": "cooling", "messages": [{"role": "user", "content": "test"}]})
             assert response.status_code == 429
             assert response.json()['error']['code'] == 'plan_pool_cooling_down'
-            assert response.json()['error']['metadata']['retry_after_seconds'] > 0
+            assert int(response.headers['retry-after']) > 0
+            assert 'metadata' not in response.json()['error']
 
 
 @pytest.mark.asyncio
@@ -269,11 +270,11 @@ async def test_transient_failover_exhaustion_and_response_binding(setup, account
             if pinned:
                 body['previous_response_id'] = 'resp_previous'
             response = await client.post('/v1/responses', headers=AUTH, json=body)
-            assert response.status_code == 503
+            assert response.status_code == (failure if isinstance(failure, int) else 503)
             code = 'upstream_failover_exhausted' if accounts == 5 and not pinned else 'upstream_unavailable'
-            assert response.json()['error']['code'] == code
-            assert response.json()['error']['metadata']['retryable'] is True
-            if code == 'upstream_unavailable':
+            assert response.json()['error']['code'] == ('InternalServiceError' if isinstance(failure, int) else code)
+            assert 'metadata' not in response.json()['error']
+            if code == 'upstream_unavailable' or isinstance(failure, int):
                 assert int(response.headers['retry-after']) > 0
     assert len(calls) == expected_calls
     assert len({r.headers['authorization'] for r in calls}) == expected_calls
@@ -302,7 +303,7 @@ async def test_ambiguous_send_not_replayed_and_pool_timeout_not_quarantined(setu
             response = await client.post('/v1/responses', headers=AUTH, json={'model': 'm', 'input': 'test'})
             busy = failure is httpx.PoolTimeout
             assert response.status_code == (503 if busy else 502)
-            assert response.json()['error']['metadata']['retryable'] is busy
+            assert 'metadata' not in response.json()['error']
     assert len(calls) == 1
     assert sum(bool(a['model_blocks']) for a in store.accounts()) == (0 if busy else 1)
     assert all(n == 0 for n in app.state.pool.inflight.values())
@@ -418,9 +419,8 @@ async def test_invalid_tool_history_never_reaches_provider(setup, chat, argument
                 assert response.status_code == 400
                 error = response.json()['error']
                 assert error['code'] == 'invalid_tool_arguments'
-                assert error['metadata']['retryable'] is False
-                assert error['metadata']['requires_request_change'] is True
-                assert 'arguments' in error['metadata']['parameter']
+                assert 'metadata' not in error
+                assert 'arguments' in error['param']
                 assert 'private-' not in response.text
     assert calls == []
     assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
@@ -442,9 +442,34 @@ async def test_provider_invalid_parameter_is_not_retried_or_cooled(setup, chat):
                 response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH,
                     json={'model':'m', 'input':'test', 'messages':[{'role':'user','content':'test'}]})
                 assert response.status_code == 400 and len(calls) == expected
-                assert response.json()['error']['metadata']['requires_request_change'] is True
-                assert response.json()['error']['metadata']['retryable'] is False
-                assert 'PRIVATE_PROVIDER_DETAIL' not in response.text
+                assert response.json() == {'error': {'code': 'InvalidParameter', 'message': 'PRIVATE_PROVIDER_DETAIL'}}
+    assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+@pytest.mark.parametrize('raw,content_type', [
+    (b'{ "error": {"code":"MissingParameter", "message":"Missing input", "param":"input", "type":"invalid_request_error"}, "request_id":"original-id" }', 'application/json; charset=utf-8'),
+    (b'upstream rejected parameters', 'text/plain'),
+])
+async def test_upstream_error_is_forwarded_without_rewriting(setup, chat, raw, content_type):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(400, content=raw, headers={'content-type': content_type, 'retry-after': '17', 'x-request-id': 'original-id'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH,
+                json={'model':'m', 'input':'test', 'messages':[{'role':'user','content':'test'}]})
+    assert response.status_code == 400
+    assert response.content == raw
+    assert response.headers['content-type'] == content_type
+    assert response.headers['retry-after'] == '17'
+    assert response.headers['x-request-id'] == 'original-id'
+    assert len(calls) == 1
     assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
 
 
@@ -463,8 +488,7 @@ async def test_flat_stream_parameter_error_does_not_quarantine_model(setup, stre
             response = await client.post('/v1/responses', headers=AUTH, json={'model':'m','input':'test','stream':stream})
             assert response.status_code == (200 if stream else 502)
             if not stream:
-                assert response.json()['error']['metadata']['upstream_code'] == 'InvalidParameter'
-                assert response.json()['error']['metadata']['requires_request_change'] is True
+                assert response.json() == {'type':'error','code':'InvalidParameter.ToolArguments', 'message':'invalid arguments'}
     assert len(calls) == 1
     assert store.account(aid)['model_blocks'] == []
     assert store.account(aid)['cooldown_kind'] is None

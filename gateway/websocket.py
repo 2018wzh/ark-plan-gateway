@@ -89,7 +89,17 @@ async def serve_responses(websocket: WebSocket, validate, generate):
 
     async def error(code, stream_id=None, status=400):
         await send({"type": "error", "status": status,
-                    "error": {"type": "gateway_error", "code": code, "message": code}}, stream_id)
+                    "error": {"type": "gateway_error", "code": code, "message": code, "param": None}}, stream_id)
+
+    async def send_rejection(result, stream_id):
+        try:
+            payload = json.loads(result.body)
+        except (ValueError, UnicodeError):
+            payload = None
+        if not isinstance(payload, dict):
+            payload = {"error": {"type": "gateway_error", "code": "upstream_rejected",
+                                 "message": result.body.decode("utf-8", errors="replace"), "param": None}}
+        await send({"type": "error", "status": result.status_code, **payload}, stream_id)
 
     async def process(raw):
         stream_id = None
@@ -116,7 +126,7 @@ async def serve_responses(websocket: WebSocket, validate, generate):
 
         rejected = validate(body)
         if rejected is not None:
-            await send({"type": "error", "status": rejected.status_code, **json.loads(rejected.body)}, stream_id)
+            await send_rejection(rejected, stream_id)
             return
         if warmup:
             response = {"id": "resp_ws_warmup_" + secrets.token_hex(12), "object": "response",
@@ -131,7 +141,7 @@ async def serve_responses(websocket: WebSocket, validate, generate):
 
         result = await generate(body, binding_id)
         if not isinstance(result, StreamingResponse):
-            await send({"type": "error", "status": result.status_code, **json.loads(result.body)}, stream_id)
+            await send_rejection(result, stream_id)
             return
         decoder = SSEDecoder()
         try:

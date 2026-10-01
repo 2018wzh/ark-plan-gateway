@@ -34,7 +34,7 @@ docker compose up -d --build
 
 在 New API 建立普通 **OpenAI Responses** 渠道：Base URL 设为网关地址（不要附加 `/v1`），Key 填 `ARK_GATEWAY_SERVICE_TOKEN`，模型配置为两类套餐共同支持的模型名，如 `ark-code-latest`。关闭该渠道自动禁用，避免账号池的额度错误禁用整条渠道；将额度错误配置为停止 New API 的重复重试。网关内部已对候选账号做一次安全切换。
 
-New API 的不同版本可能调整 Base URL 拼接及错误包装。部署前用 `/v1/responses` 分别验证同步、SSE、额度错误中 `error.metadata` 的传递；不能假定 `Retry-After` 响应头会穿过 New API。未经实例联调的版本不列为已验证版本。
+New API 的不同版本可能调整 Base URL 拼接及错误包装。部署前用 `/v1/responses` 分别验证同步、SSE 和上游错误的传递；不能假定 `Retry-After` 响应头会穿过 New API。未经实例联调的版本不列为已验证版本。
 
 直连示例：
 
@@ -61,7 +61,7 @@ OpenAI 兼容客户端的 Base URL 填 `http://127.0.0.1:8000/v1`，使用下游
 
 两种生成接口均以 `stream: true` 请求对应套餐上游，适配部分上游要求 `stream must set to be true` 的情况。客户端省略 `stream` 或设为 `false` 时，网关收集流并返回原协议的完整 JSON；设为 `true` 时实时转发 SSE。Chat Completions 额外请求 `stream_options.include_usage: true`，将 `prompt_tokens` / `completion_tokens` 纳入统计与计价，支持汇总工具调用参数与 `reasoning_content`。不做 Chat 与 Responses 之间的协议转换。中途断流不会切换账号重放；非流式请求返回 502，流式请求发送错误事件。Chat 多轮上下文由客户端在 `messages` 中传入，Responses 的 `previous_response_id` 仍绑定原账号。
 
-下游等待以 `error.metadata.retry_after_seconds` 为准；字段缺失时 `plan_quota_exhausted` 表示重置时间未知，不进行自动循环调用：
+上游 HTTP 错误保留原状态码、响应体、Content-Type、Retry-After 和请求 ID；不添加错误分类字段。网关自身错误使用 `error.message/type/code/param`，等待时间通过 `Retry-After` 响应头提供。缺少等待时间时不进行自动循环调用：
 
 ```python
 import time
@@ -69,11 +69,9 @@ import httpx
 
 response = httpx.post(url, headers=headers, json=body, timeout=180)
 if response.status_code == 429:
-    error = response.json().get("error", {})
-    if error.get("code") == "plan_pool_cooling_down":
-        seconds = error.get("metadata", {}).get("retry_after_seconds")
-        if seconds is not None:
-            time.sleep(seconds)
+    seconds = response.headers.get("Retry-After")
+    if seconds is not None and seconds.isdigit():
+        time.sleep(int(seconds))
 ```
 
 ## Responses WebSocket
@@ -91,7 +89,7 @@ wire_api = "responses"
 supports_websockets = true
 ```
 
-每轮发送顶层 JSON `{"type":"response.create","model":"ark-code-latest","input":"Reply OK"}`。上游 SSE 中的每个 JSON 事件转成一条 WebSocket 文本消息，工具事件保持原内容；请求错误返回带 `type: error`、`status` 和原有错误 metadata 的消息，连接仍可继续使用。反向代理须允许 WebSocket Upgrade。
+每轮发送顶层 JSON `{"type":"response.create","model":"ark-code-latest","input":"Reply OK"}`。上游 SSE 中的每个 JSON 事件转成一条 WebSocket 文本消息，工具与错误事件保持原内容；HTTP 请求错误使用 WebSocket 的 `type: error`、`status` 外层承载上游原 JSON，不添加 metadata，连接仍可继续使用。反向代理须允许 WebSocket Upgrade。
 
 这是 WebSocket 到方舟 HTTP/SSE 的桥接。支持同一连接顺序执行多轮、`generate: false` 预热和增量工具输出。预热只在网关内保存请求状态、返回零用量的预热响应，不发起上游生成；下一轮引用该 ID 时合并预热输入。网关在内存中保留该连接最近一次响应的输入和完整 output，`store: false` 续轮会补全上下文后经 HTTP 发送，同时保留原账号绑定。单帧及缓存最大 8 MB，缓存不会写入数据库；断开后缓存消失，未存储的会话应重连并发送完整上下文。
 
@@ -121,11 +119,11 @@ Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsag
 | 其他 5xx、发送结果不明、已接受流式响应后失败 | 当前请求不重放；服务/传输故障对该账号模型短暂退避 |
 | 网关连接池等待超时 | 返回可重试的 503，不隔离上游账号 |
 
-临时服务/连接故障在一次生成请求中最多尝试 3 次，每个账号最多一次；不在请求内等待冷却。全部候选不可用时返回池状态及可用的 `Retry-After`；达到尝试上限但仍有候选时返回 `503 upstream_failover_exhausted`。额度、鉴权等已明确拒绝的切换不消耗临时故障次数。`previous_response_id` 仍绑定原账号，不跨账号重放。5xx 切换优先保障可用性，但可能产生重复的上游计算或计费，无法保证所有上游故障时调用成功。
+临时服务/连接故障在一次生成请求中最多尝试 3 次，每个账号最多一次；不在请求内等待冷却。切换未成功时返回最后一次上游 HTTP 错误的原状态码与响应体。没有上游 HTTP 错误可供返回时，全部候选不可用返回池状态及可用的 `Retry-After`；达到尝试上限但仍有候选时返回 `503 upstream_failover_exhausted`。额度、鉴权等已明确拒绝的切换不消耗临时故障次数。`previous_response_id` 仍绑定原账号，不跨账号重放。5xx 切换优先保障可用性，但可能产生重复的上游计算或计费，无法保证所有上游故障时调用成功。
 
 默认退避按连续失败次数在 10、20、40…300 秒窗口内取 50%–100% 随机延迟；上游有效 `Retry-After` 是最短等待下限，不截短。冷却结束后只允许一个并发请求试探，完整成功才恢复；较早的成功请求不能清除新发生的失败状态。模型隔离、失败次数和冷却会跨重启保留。账号详情展示原因码及恢复时间，手动恢复清除同一额度主体的冷却、模型隔离和鉴权失败状态。
 
-下游错误 `metadata` 可包含 `upstream_status`、白名单 `upstream_code`、`category`、`blocking_codes`、`retryable`、`requires_admin`，并保留原有等待字段。不会回传或持久化完整上游错误消息；未知错误码显示为 `UnknownUpstreamError`。`retryable: false` 表示网关不能保证重放安全或需要修改请求，不应据此无限重试。
+错误分类与白名单原因码仅用于内部账号调度和管理页，不改写下游上游错误，也不持久化完整上游错误消息。请求参数错误不自动切换账号，不重复发送相同请求。SSE 错误事件直接透传；将 SSE 汇总为非流式响应时，返回原错误事件 JSON 和 HTTP 502。
 
 ## AK/SK 与统计
 

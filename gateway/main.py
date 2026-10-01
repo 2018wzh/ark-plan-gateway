@@ -10,7 +10,6 @@ import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -44,19 +43,16 @@ def password_ok(password: str, hashed: str) -> bool:
     return hmac.compare_digest(password_hash(password, salt), hashed)
 
 
-def error_response(status: int, code: str, retry_at: float | None = None, exact: bool = False,
-                   details: dict | None = None) -> JSONResponse:
-    metadata = {**(details or {}), "reset_time_known": retry_at is not None, "exact_pool_minimum": exact}
+def error_response(status: int, code: str, retry_at: float | None = None,
+                   param: str | None = None) -> JSONResponse:
     headers = {}
-    message = {"invalid_tool_arguments": "Tool-call history contains invalid JSON arguments. Repair the failed tool turn before retrying; do not resend unchanged history.",
-               "upstream_request_rejected": "Upstream rejected the request parameters. Correct the request before retrying; switching accounts will not fix it."}.get(code, code)
+    message = code
     if retry_at is not None:
         seconds = max(1, int(retry_at - time.time() + 0.999))
-        metadata.update(retry_after_seconds=seconds, retry_at=datetime.fromtimestamp(retry_at, timezone.utc).isoformat())
         headers["Retry-After"] = str(seconds)
         message = f"{code}; retry after {seconds} seconds"
     return JSONResponse({"error": {"message": message, "type": "gateway_error", "code": code,
-                                   "metadata": metadata}}, status_code=status, headers=headers)
+                                   "param": param}}, status_code=status, headers=headers)
 
 
 def token_usage(response: object, chat: bool = False) -> tuple[int, int]:
@@ -375,27 +371,19 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     pinned: str | None, stream: bool = False):
         chat = path == "/chat/completions"
         attempted: set[str] = set()
-        last_error: dict = {}
+        last_response = None
         transient_failures = 0
         while True:
             candidates = await pool.candidates(model, pinned, attempted)
             if not candidates:
-                status, code, retry_at, exact = pool.unavailable(model, pinned)
-                reasons = set()
-                for a in store.accounts():
-                    if model not in a["models"] or (pinned and a["id"] != pinned):
-                        continue
-                    if a["cooldown_code"]:
-                        reasons.add(a["cooldown_code"])
-                    block = pool.model_block(a, model)
-                    if block:
-                        reasons.add(block["code"])
-                return error_response(status, code, retry_at, exact,
-                                      {**last_error, "blocking_codes": sorted(reasons), "retryable": retry_at is not None,
-                                       "requires_admin": retry_at is None})
+                if last_response is not None:
+                    return last_response
+                status, code, retry_at, _ = pool.unavailable(model, pinned)
+                return error_response(status, code, retry_at)
             if transient_failures >= MAX_TRANSIENT_FAILURES:
-                return error_response(503, "upstream_failover_exhausted",
-                                      details={**last_error, "retryable": True, "requires_admin": False})
+                if last_response is not None:
+                    return last_response
+                return error_response(503, "upstream_failover_exhausted")
             account = candidates[0]
             attempted.add(account["id"])
             if not await pool.reserve(account, model):
@@ -435,7 +423,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 upstream = await client.send(req, stream=True)
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 record("connection_error")
-                last_error = {"category": "transport"}
+                last_response = None
                 if method == "POST":
                     pool.update_result(account, "server", None, model)
                 with anyio.CancelScope(shield=True):
@@ -443,18 +431,18 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 if method == "POST":
                     transient_failures += 1
                     continue
-                return error_response(502, "upstream_connection_failed", details={**last_error, "retryable": True})
+                return error_response(502, "upstream_connection_failed")
             except httpx.PoolTimeout:
                 record("connection_pool_busy")
                 with anyio.CancelScope(shield=True):
                     await pool.release(account)
-                return error_response(503, "gateway_connection_pool_busy", details={"retryable": True})
+                return error_response(503, "gateway_connection_pool_busy")
             except (httpx.TimeoutException, httpx.TransportError):
                 record("transport_error")
                 if method == "POST":
                     pool.update_result(account, "server", None, model)
                 await pool.release(account)
-                return error_response(502, "upstream_transport_ambiguous", details={"category": "transport", "retryable": False})
+                return error_response(502, "upstream_transport_ambiguous")
             except asyncio.CancelledError:
                 record("client_disconnected")
                 with anyio.CancelScope(shield=True):
@@ -482,7 +470,9 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     raise
                 kind, until = classify_error(upstream.status_code, raw, upstream.headers, time.time())
                 code = safe_error_code(raw)
-                last_error = {"upstream_status": upstream.status_code, "upstream_code": code, "category": kind}
+                last_response = Response(content=raw, status_code=upstream.status_code,
+                    headers={key: value for key, value in upstream.headers.items()
+                             if key in ("content-type", "retry-after", "x-request-id", "x-tt-logid")})
                 record(kind)
                 # A lookup/deletion error must not quarantine a working model.
                 if method == "POST" or kind in ("quota", "rate", "auth", "account"):
@@ -494,12 +484,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     continue
                 if kind in ("quota", "rate", "model_rate", "auth", "account", "model", "model_limit", "overload") and method == "POST" and upstream.status_code < 500:
                     continue
-                gateway_code = {"permission": "upstream_permission_denied", "request": "upstream_request_rejected",
-                                "server": "upstream_server_error"}.get(kind, "upstream_rejected")
-                if upstream.status_code >= 500:
-                    gateway_code = "upstream_server_error"
-                return error_response(upstream.status_code if upstream.status_code < 500 else 502, gateway_code,
-                                      details={**last_error, "retryable": False, "requires_request_change": kind == "request"})
+                return last_response
             upstream_sse = upstream.headers.get("content-type", "").split(";", 1)[0].strip() == "text/event-stream"
             if not upstream_sse:
                 try:
@@ -542,7 +527,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         raw_error = json.dumps({"error": error}).encode()
                         kind, until = classify_error(500, raw_error, {}, time.time())
                         code = safe_error_code(raw_error)
-                        stream_error.update(upstream_code=code, category=kind, retryable=False, requires_request_change=kind == "request")
+                        stream_error.update(obj)
                         pool.update_result(account, kind, until, model, code)
 
             if not stream:
@@ -561,7 +546,9 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     outcome = "stream_error"
                     if not state.failed:
                         pool.update_result(account, "server", None, model)
-                    return error_response(502, "upstream_stream_incomplete", details={"retryable": False, **stream_error})
+                    if stream_error:
+                        return JSONResponse(stream_error, status_code=502)
+                    return error_response(502, "upstream_stream_incomplete")
                 finally:
                     record(outcome, state.usage_response)
                     await close_upstream()
@@ -575,12 +562,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     outcome = "stream_error" if state.failed or not state.done else "success"
                     if not state.failed and not state.done:
                         pool.update_result(account, "server", None, model)
-                        yield b'\ndata: {"error":{"code":"upstream_stream_incomplete"}}\n\n'
+                        yield b'\ndata: {"error":{"message":"upstream_stream_incomplete","type":"gateway_error","code":"upstream_stream_incomplete","param":null}}\n\n'
                 except (httpx.TimeoutException, httpx.TransportError, ValueError, KeyError, TypeError):
                     outcome = "stream_error"
                     if not state.failed:
                         pool.update_result(account, "server", None, model)
-                    yield b"\nevent: error\ndata: {\"error\":{\"code\":\"upstream_stream_interrupted\"}}\n\n"
+                    yield b'\nevent: error\ndata: {"error":{"message":"upstream_stream_interrupted","type":"gateway_error","code":"upstream_stream_interrupted","param":null}}\n\n'
                 finally:
                     record(outcome, state.usage_response)
                     await close_upstream()
@@ -596,8 +583,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return error_response(400, "stream_must_be_boolean")
         invalid_arguments = invalid_tool_arguments(data, chat)
         if invalid_arguments:
-            return error_response(400, "invalid_tool_arguments", details={"category": "request", "retryable": False,
-                                  "requires_request_change": True, "parameter": invalid_arguments})
+            return error_response(400, "invalid_tool_arguments", param=invalid_arguments)
         if chat:
             if not isinstance(data.get("messages"), list) or not data["messages"]:
                 return error_response(400, "messages_required")

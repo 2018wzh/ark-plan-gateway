@@ -170,7 +170,7 @@ def test_concurrent_failure_snapshots_do_not_reset_backoff(store):
     (429, 'InflightBatchsizeExceeded', 2, 200), (429, 'UnknownCode', 2, 200),
     (404, 'UnsupportedModel', 2, 200), (500, 'InternalServiceError', 2, 200),
     (503, 'ServerOverloaded', 2, 200), (401, 'MCPInvalidCredential', 1, 401),
-    (501, 'InternalServiceError', 1, 502), (503, 'InvalidParameter', 1, 502),
+    (501, 'InternalServiceError', 1, 501), (503, 'InvalidParameter', 1, 503),
 ])
 async def test_http_policy_and_metadata(store, monkeypatch, status, code, expected_calls, expected_status):
     monkeypatch.setenv('ARK_GATEWAY_ALLOW_UNCONFIGURED', '1')
@@ -190,10 +190,10 @@ async def test_http_policy_and_metadata(store, monkeypatch, status, code, expect
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
             r = await client.post('/v1/responses', headers={'authorization': 'Bearer service-token-123456789012345'}, json={'model': 'm', 'input': 'test'})
             assert r.status_code == expected_status
-            assert 'DO_NOT_EXPOSE' not in r.text
             if expected_status != 200:
-                assert r.json()['error']['metadata']['upstream_code'] == code
-                assert r.json()['error']['metadata']['retryable'] is False
+                assert r.content == error(code, 'DO_NOT_EXPOSE_PRIVATE_ERROR')
+            else:
+                assert 'DO_NOT_EXPOSE' not in r.text
     assert len(calls) == expected_calls
     assert all(a['auth_failed'] == 0 for a in store.accounts())
     assert len(await app.state.pool.candidates('other')) >= 1
@@ -213,8 +213,8 @@ async def test_admin_resume_and_model_discovery(store, monkeypatch):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
             assert [m['id'] for m in (await client.get('/v1/models', headers=headers)).json()['data']] == ['other']
             failed = await client.post('/v1/responses', headers=headers, json={'model':'m','input':'test'})
-            assert failed.json()['error']['metadata']['blocking_codes'] == ['UnsupportedModel']
-            assert failed.json()['error']['metadata']['requires_admin'] is True
+            assert 'metadata' not in failed.json()['error']
+            assert failed.status_code >= 400
             await client.post('/api/login', json={'password': 'test-password-123'})
             edited = await client.patch(f'/api/accounts/{aid}', json={'label': 'renamed', 'models': ['m','other'], 'model_mapping': {}, 'api_key': None})
             assert edited.status_code == 200 and len(edited.json()['model_blocks']) == 1
@@ -288,14 +288,16 @@ async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, mo
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
         app = create_app(store, remote)
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
-            for _ in range(2):
+            for turn in range(2):
                 response = await client.post(path, headers={'authorization': 'Bearer service-token-123456789012345'},
                                              json={'model': 'm', 'input': 'test', 'messages': [{'role': 'user', 'content': 'test'}]})
                 assert response.status_code == 429
-                assert response.json()['error']['code'] == ('plan_pool_cooling_down' if known else 'plan_quota_exhausted')
-                if known:
+                assert response.json()['error']['code'] == ('QuotaExceeded' if turn == 0 else 'plan_pool_cooling_down' if known else 'plan_quota_exhausted')
+                assert 'metadata' not in response.json()['error']
+                if known and turn == 0:
+                    assert int(response.headers['retry-after']) == 7200
+                elif known:
                     assert 3598 <= int(response.headers['retry-after']) <= 3600
-                    assert response.json()['error']['metadata']['reset_time_known'] is True
                 else:
                     assert 'retry-after' not in response.headers
     assert len(calls) == 2
