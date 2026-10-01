@@ -9,9 +9,20 @@ import random
 import re
 
 
+def gateway_error(status: int, code: str, param: str | None = None, message: str | None = None) -> dict:
+    """Local errors use Ark's HTTP error shape, without posing as provider errors."""
+    error_type = {401: "Unauthorized", 403: "Forbidden", 404: "NotFound", 409: "Conflict",
+                  413: "PayloadTooLarge", 424: "FailedDependency", 429: "TooManyRequests"}.get(
+        status, "InternalServerError" if status >= 500 else "BadRequest")
+    error = {"code": "Gateway." + code, "message": message or "Gateway: " + code, "type": error_type}
+    if param is not None:
+        error["param"] = param
+    return {"error": error}
+
+
 MODEL_ERRORS = {"OperationDenied.ServiceNotOpen", "ModelNotOpen", "UnsupportedModel",
                 "InvalidEndpointOrModel.NotFound", "InvalidEndpointOrModel.ModelIDAccessDisabled"}
-ACCOUNT_ERRORS = {"OperationDenied.ServiceOverdue", "AccountOverdueError", "InvalidAccountStatus"}
+ACCOUNT_ERRORS = {"OperationDenied.ServiceOverdue", "AccountOverdueError", "InvalidAccountStatus", "InvalidSubscription"}
 OVERLOAD_ERRORS = {"ServerOverloaded", "RequestBurstTooFast"}
 RATE_ERRORS = {"TooManyRequests", "AccountRateLimitExceeded", "APIAccountRpmRateLimitExceeded",
                "ModelAccountRpmRateLimitExceeded", "ModelAccountTpmRateLimitExceeded",

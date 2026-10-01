@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import time
 
@@ -144,7 +145,7 @@ async def test_models_list_and_validation(setup):
             response = await client.post('/v1/chat/completions', headers=AUTH,
                                          json={"model": "cooling", "messages": [{"role": "user", "content": "test"}]})
             assert response.status_code == 429
-            assert response.json()['error']['code'] == 'plan_pool_cooling_down'
+            assert response.json()['error']['code'] == 'Gateway.plan_pool_cooling_down'
             assert int(response.headers['retry-after']) > 0
             assert 'metadata' not in response.json()['error']
 
@@ -272,7 +273,7 @@ async def test_transient_failover_exhaustion_and_response_binding(setup, account
             response = await client.post('/v1/responses', headers=AUTH, json=body)
             assert response.status_code == (failure if isinstance(failure, int) else 503)
             code = 'upstream_failover_exhausted' if accounts == 5 and not pinned else 'upstream_unavailable'
-            assert response.json()['error']['code'] == ('InternalServiceError' if isinstance(failure, int) else code)
+            assert response.json()['error']['code'] == ('InternalServiceError' if isinstance(failure, int) else 'Gateway.' + code)
             assert 'metadata' not in response.json()['error']
             if code == 'upstream_unavailable' or isinstance(failure, int):
                 assert int(response.headers['retry-after']) > 0
@@ -418,7 +419,7 @@ async def test_invalid_tool_history_never_reaches_provider(setup, chat, argument
                 response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH, json=body)
                 assert response.status_code == 400
                 error = response.json()['error']
-                assert error['code'] == 'invalid_tool_arguments'
+                assert error['code'] == 'Gateway.invalid_tool_arguments'
                 assert 'metadata' not in error
                 assert 'arguments' in error['param']
                 assert 'private-' not in response.text
@@ -447,9 +448,175 @@ async def test_provider_invalid_parameter_is_not_retried_or_cooled(setup, chat):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('plan', ['agent', 'coding'])
+@pytest.mark.parametrize('status', [200, 400, 404])
+async def test_compaction_preserves_native_request_and_upstream_result(setup, plan, status):
+    store, create_app = setup
+    account = store.add_account(plan, 'a', models=['alias'])
+    store.update(account, model_mapping={'alias':'real-model'})
+    calls = []
+    body = {'model':'alias', 'instructions':'compact context', 'input':[
+        {'type':'message','role':'user','content':[{'type':'input_text','text':'long context'}]},
+        {'type':'reasoning','id':'reasoning_one','summary':[], 'encrypted_content':'opaque'},
+        {'type':'message','role':'assistant','content':''},
+        {'type':'function_call','name':'tool','call_id':'call_one','arguments':'{}'},
+        {'type':'function_call_output','call_id':'call_one','output':'original result'},
+        {'type':'compaction','encrypted_content':'prior-opaque'},
+    ], 'provider_extension':{'enabled':True}}
+    if status == 200:
+        payload = {'id':'cmp_one','object':'response.compaction','output':[{'type':'compaction','encrypted_content':'new-opaque'}],
+                   'usage':{'input_tokens':100,'output_tokens':10,'total_tokens':110}}
+    else:
+        payload = {'error':{'code':'MissingParameter' if status == 400 else 'PathNotFound',
+                           'message':'original provider error; Request ID: original-id','type':'BadRequest' if status == 400 else 'NotFound','param':''}}
+    raw = json.dumps(payload, indent=2).encode()
+    def upstream(request):
+        calls.append(request)
+        assert request.url.path == ('/api/plan/v3/responses/compact' if plan == 'agent' else '/api/coding/v3/responses/compact')
+        assert json.loads(request.content) == {**body, 'model':'real-model'}
+        assert request.headers.get('accept') != 'text/event-stream'
+        return httpx.Response(status, content=raw, headers={'content-type':'application/json','x-request-id':'original-id'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/responses/compact', headers=AUTH, json=body)
+    assert response.status_code == status and response.content == raw
+    assert response.headers['x-request-id'] == 'original-id'
+    assert len(calls) == 1
+    assert store.lookup_binding('cmp_one') is None
+    assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+@pytest.mark.parametrize('interrupted', [False, True])
+async def test_gateway_stream_errors_follow_endpoint_event_schema(setup, chat, interrupted):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    partial = {'id':'chat_one','choices':[{'index':0,'delta':{'content':'partial'},'finish_reason':None}]} if chat else {
+        'type':'response.output_text.delta','delta':'partial','sequence_number':7}
+    def upstream(request):
+        return httpx.Response(200, stream=BytesStream(sse(partial), fail=interrupted), headers={'content-type':'text/event-stream'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH,
+                json={'model':'m','input':'test','messages':[{'role':'user','content':'test'}],'stream':True})
+    events = list(SSEDecoder().feed(response.content))
+    assert events[0] == partial
+    failure = 'upstream_stream_interrupted' if interrupted else 'upstream_stream_incomplete'
+    if chat:
+        assert events[1] == {'type':'error','error':{'code':'Gateway.' + failure,
+                             'message':'Gateway: ' + failure, 'type':'InternalServerError'}}
+    else:
+        assert events[1] == {'type':'error','code':'Gateway.' + failure,'message':'Gateway: ' + failure,
+                             'param':None,'sequence_number':8}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+@pytest.mark.parametrize('plan,status,error_type,code,message', [
+    ('coding',400,'BadRequest','MissingParameter','missing input; Request ID: original-id'),
+    ('agent',400,'BadRequest','InvalidParameter.Input','invalid input; Request ID: original-id'),
+    ('coding',400,'Forbidden','InvalidSubscription','coding plan subscription expired'),
+    ('coding',429,'TooManyRequests','QuotaExceeded','5-hour usage quota exhausted; resets at 2030-01-01T00:00:00Z'),
+    ('agent',429,'TooManyRequests','QuotaExceeded.AgentPlanQuotaExceeded','Agent Plan AFP exhausted'),
+    ('agent',400,'FutureProviderType','FutureProviderCode','new upstream error'),
+])
+async def test_plan_error_conventions_are_forwarded_unchanged(setup, chat, plan, status, error_type, code, message):
+    store, create_app = setup
+    for key in ('first-key','second-key'):
+        store.add_account(plan, key, models=['m'])
+    calls = []
+    payload = {'error':{'type':error_type, 'code':code, 'message':message, 'param':'input'}, 'request_id':'original-id'}
+    raw = json.dumps(payload, indent=2).encode()
+    def upstream(request):
+        calls.append(request)
+        assert request.url.path.startswith('/api/coding/v3/' if plan == 'coding' else '/api/plan/v3/')
+        return httpx.Response(status, content=raw, headers={'content-type':'application/json','x-request-id':'original-id'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH,
+                json={'model':'m','input':'test','messages':[{'role':'user','content':'test'}]})
+    assert response.status_code == status
+    assert response.content == raw
+    assert response.headers['x-request-id'] == 'original-id'
+    assert len(calls) == (2 if code in ('QuotaExceeded','QuotaExceeded.AgentPlanQuotaExceeded','InvalidSubscription') else 1)
+
+
+@pytest.mark.asyncio
+async def test_gateway_http_errors_use_consistent_api_envelope(setup):
+    store, create_app = setup
+    def upstream(request):
+        pytest.fail('must not contact upstream')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            for method, path, headers, status, error_type in [
+                ('GET', '/v1/models', {}, 401, 'Unauthorized'),
+                ('GET', '/v1/unknown', AUTH, 404, 'NotFound'),
+                ('GET', '/v1/responses', AUTH, 405, 'BadRequest'),
+            ]:
+                response = await client.request(method, path, headers=headers)
+                assert response.status_code == status
+                assert set(response.json()) == {'error'}
+                assert set(response.json()['error']) == {'message', 'type', 'code'}
+                assert response.json()['error']['code'].startswith('Gateway.')
+                assert response.json()['error']['type'] == error_type
+                if status == 405:
+                    assert 'POST' in response.headers['allow']
+            response = await client.post('/api/login', json={'password':'wrong'})
+            assert response.status_code == 401 and response.json() == {'detail':'invalid password'}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['error', 'json', 'stream', 'aggregate'])
+async def test_response_headers_preserve_upstream_extensions_and_filter_connection_fields(setup, mode):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    result = {'id':'resp_headers', 'model':'m', 'status':'completed', 'output':[], 'usage':{'input_tokens':1,'output_tokens':2}}
+    payload = (b'{ "error": {"code":"MissingParameter", "message":"missing input"} }' if mode == 'error'
+               else json.dumps(result).encode() if mode == 'json'
+               else sse({'type':'response.completed','response':result}))
+    content_type = 'text/event-stream' if mode in ('stream', 'aggregate') else 'application/json'
+    headers = [('content-type', content_type), ('content-encoding','gzip'),
+               ('etag','compressed-etag'), ('content-digest','compressed-digest'),
+               ('connection','keep-alive, X-Hop'), ('x-hop','not-forwarded'), ('transfer-encoding','chunked'),
+               ('x-ratelimit-remaining-tokens','123'), ('x-request-id','original-id'), ('x-provider-extension','original'),
+               ('www-authenticate','Bearer realm="one"'), ('www-authenticate','Bearer realm="two"')]
+    def upstream(request):
+        return httpx.Response(400 if mode == 'error' else 200, stream=BytesStream(gzip.compress(payload)), headers=headers)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model':'m','input':'test','stream':mode == 'stream'})
+    assert response.status_code == (400 if mode == 'error' else 200)
+    assert response.headers['x-ratelimit-remaining-tokens'] == '123'
+    assert response.headers['x-provider-extension'] == 'original'
+    assert response.headers['x-request-id'] == 'original-id'
+    assert response.headers.get_list('www-authenticate') == ['Bearer realm="one"', 'Bearer realm="two"']
+    assert not any(key in response.headers for key in ('connection','x-hop','transfer-encoding','content-encoding','etag','content-digest'))
+    if mode == 'aggregate':
+        assert response.json() == result and response.headers['content-type'] == 'application/json'
+    else:
+        assert response.content == payload and response.headers['content-type'] == content_type
+    if 'content-length' in response.headers:
+        assert int(response.headers['content-length']) == len(response.content)
+
+
+@pytest.mark.asyncio
+async def test_stream_does_not_append_gateway_error_after_upstream_error(setup):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    payload = sse({'type':'error', 'code':'MissingParameter', 'message':'missing input', 'param':'input'})
+    def upstream(request):
+        return httpx.Response(200, stream=BytesStream(payload, fail=True), headers={'content-type':'text/event-stream'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model':'m','input':'test','stream':True})
+    assert response.status_code == 200 and response.content == payload
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('chat', [False, True])
 @pytest.mark.parametrize('raw,content_type', [
-    (b'{ "error": {"code":"MissingParameter", "message":"Missing input", "param":"input", "type":"invalid_request_error"}, "request_id":"original-id" }', 'application/json; charset=utf-8'),
+    (b'{ "error": {"code":"MissingParameter", "message":"Missing input", "param":"input", "type":"BadRequest"}, "request_id":"original-id" }', 'application/json; charset=utf-8'),
     (b'upstream rejected parameters', 'text/plain'),
 ])
 async def test_upstream_error_is_forwarded_without_rewriting(setup, chat, raw, content_type):

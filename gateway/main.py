@@ -18,11 +18,12 @@ import anyio
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
 from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments
-from .errors import safe_error_code
+from .errors import gateway_error, safe_error_code
 from .store import Store
 from .websocket import serve_responses
 
@@ -46,13 +47,27 @@ def password_ok(password: str, hashed: str) -> bool:
 def error_response(status: int, code: str, retry_at: float | None = None,
                    param: str | None = None) -> JSONResponse:
     headers = {}
-    message = code
+    message = None
     if retry_at is not None:
         seconds = max(1, int(retry_at - time.time() + 0.999))
         headers["Retry-After"] = str(seconds)
         message = f"{code}; retry after {seconds} seconds"
-    return JSONResponse({"error": {"message": message, "type": "gateway_error", "code": code,
-                                   "param": param}}, status_code=status, headers=headers)
+    return JSONResponse(gateway_error(status, code, param, message), status_code=status, headers=headers)
+
+
+def forward_response_headers(response: Response, upstream: httpx.Response, transformed: bool = False):
+    # httpx decodes the body; HTTP framing and connection state belong to this hop.
+    excluded = {"connection", "proxy-connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer",
+                "transfer-encoding", "upgrade", "content-length", "content-encoding"}
+    excluded.update(value.strip().lower() for value in upstream.headers.get("connection", "").split(","))
+    if transformed or upstream.headers.get("content-encoding"):
+        excluded.update({"etag", "content-md5", "digest", "content-digest", "repr-digest", "content-range"})
+    if transformed:
+        excluded.add("content-type")
+    forwarded = [(key.lower(), value) for key, value in upstream.headers.raw if key.decode("ascii").lower() not in excluded]
+    names = {key for key, _ in forwarded}
+    response.raw_headers = [(key, value) for key, value in response.raw_headers if key not in names] + forwarded
+    return response
 
 
 def token_usage(response: object, chat: bool = False) -> tuple[int, int]:
@@ -197,6 +212,15 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     app.state.store = store
     app.state.pool = pool
     app.state.client = client
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException):
+        if request.url.path == "/v1" or request.url.path.startswith("/v1/"):
+            code = {401: "invalid_token", 404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "request_rejected")
+            response = error_response(exc.status_code, code)
+            response.headers.update(exc.headers or {})
+            return response
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
 
     def require_service(request: Request | WebSocket):
         auth = request.headers.get("authorization", "")
@@ -370,6 +394,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     async def proxy(request: Request | None, method: str, path: str, body: bytes | None, model: str,
                     pinned: str | None, stream: bool = False):
         chat = path == "/chat/completions"
+        generation = method == "POST" and path in ("/responses", "/chat/completions")
         attempted: set[str] = set()
         last_response = None
         transient_failures = 0
@@ -404,7 +429,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
             headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json"}
-            if method == "POST":
+            if generation:
                 headers["Accept"] = "text/event-stream"
             try:
                 account_body = body
@@ -415,9 +440,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         account_json["model"] = mapped
                     # Plan/model variants may require streaming. Request it on the
                     # first attempt; never replay an accepted generation to adapt.
-                    account_json["stream"] = True
-                    if chat:
-                        account_json["stream_options"] = {**account_json.get("stream_options", {}), "include_usage": True}
+                    if generation:
+                        account_json["stream"] = True
+                        if chat:
+                            account_json["stream_options"] = {**account_json.get("stream_options", {}), "include_usage": True}
                     account_body = json.dumps(account_json, ensure_ascii=False).encode()
                 req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
@@ -470,9 +496,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     raise
                 kind, until = classify_error(upstream.status_code, raw, upstream.headers, time.time())
                 code = safe_error_code(raw)
-                last_response = Response(content=raw, status_code=upstream.status_code,
-                    headers={key: value for key, value in upstream.headers.items()
-                             if key in ("content-type", "retry-after", "x-request-id", "x-tt-logid")})
+                last_response = forward_response_headers(Response(content=raw, status_code=upstream.status_code), upstream)
                 record(kind)
                 # A lookup/deletion error must not quarantine a working model.
                 if method == "POST" or kind in ("quota", "rate", "auth", "account"):
@@ -493,11 +517,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         return error_response(502, "upstream_stream_expected")
                     raw = await upstream.aread()
                     data = json.loads(raw)
-                    if not chat and isinstance(data, dict) and data.get("id"):
+                    if path == "/responses" and isinstance(data, dict) and data.get("id"):
                         store.bind(data["id"], account["id"])
                     record("success", data)
-                    return Response(content=raw, status_code=upstream.status_code,
-                                    media_type=upstream.headers.get("content-type", "application/json"))
+                    return forward_response_headers(Response(content=raw, status_code=upstream.status_code,
+                                    media_type=upstream.headers.get("content-type", "application/json")), upstream)
                 except (httpx.TimeoutException, httpx.TransportError, ValueError):
                     record("response_error")
                     if method == "POST":
@@ -509,12 +533,17 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             decoder = SSEDecoder()
             state = StreamResult(chat, collect=not stream)
             stream_error: dict = {}
+            last_sequence_number = -1
 
             def observe(chunk: bytes):
+                nonlocal last_sequence_number
                 for obj in decoder.feed(chunk):
                     state.observe(obj)
                     if obj is None:
                         continue
+                    sequence = obj.get("sequence_number")
+                    if isinstance(sequence, int) and not isinstance(sequence, bool):
+                        last_sequence_number = max(last_sequence_number, sequence)
                     response_obj = obj.get("response", {})
                     if not chat and isinstance(response_obj, dict) and response_obj.get("id"):
                         store.bind(response_obj["id"], account["id"])
@@ -541,17 +570,25 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                             raise ProtocolError("upstream_stream_failed")
                     data = state.result()
                     outcome = "success"
-                    return JSONResponse(data, status_code=upstream.status_code)
+                    return forward_response_headers(JSONResponse(data, status_code=upstream.status_code), upstream, transformed=True)
                 except (httpx.TimeoutException, httpx.TransportError, ValueError, KeyError, TypeError):
                     outcome = "stream_error"
                     if not state.failed:
                         pool.update_result(account, "server", None, model)
                     if stream_error:
-                        return JSONResponse(stream_error, status_code=502)
+                        return forward_response_headers(JSONResponse(stream_error, status_code=502), upstream, transformed=True)
                     return error_response(502, "upstream_stream_incomplete")
                 finally:
                     record(outcome, state.usage_response)
                     await close_upstream()
+
+            def failure_event(code):
+                if chat:
+                    event = gateway_error(502, code)
+                else:
+                    event = {"type": "error", "code": "Gateway." + code, "message": "Gateway: " + code,
+                             "param": None, "sequence_number": last_sequence_number + 1}
+                return b'\nevent: error\ndata: ' + json.dumps(event).encode() + b'\n\n'
 
             async def events():
                 outcome = "client_disconnected"
@@ -562,23 +599,25 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     outcome = "stream_error" if state.failed or not state.done else "success"
                     if not state.failed and not state.done:
                         pool.update_result(account, "server", None, model)
-                        yield b'\ndata: {"error":{"message":"upstream_stream_incomplete","type":"gateway_error","code":"upstream_stream_incomplete","param":null}}\n\n'
+                        yield failure_event("upstream_stream_incomplete")
                 except (httpx.TimeoutException, httpx.TransportError, ValueError, KeyError, TypeError):
                     outcome = "stream_error"
                     if not state.failed:
                         pool.update_result(account, "server", None, model)
-                    yield b'\nevent: error\ndata: {"error":{"message":"upstream_stream_interrupted","type":"gateway_error","code":"upstream_stream_interrupted","param":null}}\n\n'
+                        yield failure_event("upstream_stream_interrupted")
                 finally:
                     record(outcome, state.usage_response)
                     await close_upstream()
 
-            return StreamingResponse(events(), status_code=upstream.status_code, media_type="text/event-stream",
-                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            return forward_response_headers(StreamingResponse(events(), status_code=upstream.status_code, media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}), upstream)
 
-    def validate_generation(data: object, chat: bool):
+    def validate_generation(data: object, chat: bool, compact: bool = False):
         model = data.get("model") if isinstance(data, dict) else None
         if not isinstance(model, str) or not model:
             return error_response(400, "model_required")
+        if compact:
+            return model, None
         if "stream" in data and not isinstance(data["stream"], bool):
             return error_response(400, "stream_must_be_boolean")
         invalid_arguments = invalid_tool_arguments(data, chat)
@@ -600,7 +639,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return error_response(404, "previous_response_unknown")
         return model, pinned
 
-    async def create_generation(request: Request, chat: bool):
+    async def create_generation(request: Request, chat: bool, compact: bool = False):
         require_service(request)
         raw = await request.body()
         if len(raw) > 8_000_000:
@@ -609,16 +648,20 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             data = json.loads(raw)
         except ValueError:
             return error_response(400, "invalid_json")
-        validated = validate_generation(data, chat)
+        validated = validate_generation(data, chat, compact)
         if isinstance(validated, Response):
             return validated
         model, pinned = validated
-        return await proxy(request, "POST", "/chat/completions" if chat else "/responses",
-                           raw, model, pinned, data.get("stream", False))
+        path = "/responses/compact" if compact else "/chat/completions" if chat else "/responses"
+        return await proxy(request, "POST", path, raw, model, pinned, False if compact else data.get("stream", False))
 
     @app.post("/v1/responses")
     async def responses(request: Request):
         return await create_generation(request, chat=False)
+
+    @app.post("/v1/responses/compact")
+    async def compact_responses(request: Request):
+        return await create_generation(request, chat=False, compact=True)
 
     @app.websocket("/v1/responses")
     async def websocket_responses(websocket: WebSocket):

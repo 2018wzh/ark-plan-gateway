@@ -1,6 +1,6 @@
 # Ark Plan Gateway
 
-火山方舟 Agent Plan / Coding Plan 个人版网关。按模型选择可用密钥，在额度耗尽时切换账号；WebUI 提供账号、额度和路由管理。`POST /v1/responses`、`POST /v1/chat/completions` 均支持同步与实时 SSE，`/v1/responses` 还提供 WebSocket 接入，`GET /v1/models` 提供 OpenAI 格式的模型列表。
+火山方舟 Agent Plan / Coding Plan 个人版网关。按模型选择可用密钥，在额度耗尽时切换账号；WebUI 提供账号、额度和路由管理。`POST /v1/responses`、`POST /v1/chat/completions` 均支持同步与实时 SSE，`POST /v1/responses/compact` 原生透传压缩请求，`/v1/responses` 还提供 WebSocket 接入，`GET /v1/models` 提供 OpenAI 格式的模型列表。
 
 ## 启动
 
@@ -61,7 +61,7 @@ OpenAI 兼容客户端的 Base URL 填 `http://127.0.0.1:8000/v1`，使用下游
 
 两种生成接口均以 `stream: true` 请求对应套餐上游，适配部分上游要求 `stream must set to be true` 的情况。客户端省略 `stream` 或设为 `false` 时，网关收集流并返回原协议的完整 JSON；设为 `true` 时实时转发 SSE。Chat Completions 额外请求 `stream_options.include_usage: true`，将 `prompt_tokens` / `completion_tokens` 纳入统计与计价，支持汇总工具调用参数与 `reasoning_content`。不做 Chat 与 Responses 之间的协议转换。中途断流不会切换账号重放；非流式请求返回 502，流式请求发送错误事件。Chat 多轮上下文由客户端在 `messages` 中传入，Responses 的 `previous_response_id` 仍绑定原账号。
 
-上游 HTTP 错误保留原状态码、响应体、Content-Type、Retry-After 和请求 ID；不添加错误分类字段。网关自身错误使用 `error.message/type/code/param`，等待时间通过 `Retry-After` 响应头提供。缺少等待时间时不进行自动循环调用：
+上游 HTTP 错误保留原状态码、响应体和端到端响应头（包括 Content-Type、Retry-After、请求 ID、限流头及供应商扩展字段）；不添加错误分类字段。网关自身错误使用方舟的 `error.code/message/type` 结构，涉及具体参数时才包含 `param`，等待时间通过 `Retry-After` 响应头提供。缺少等待时间时不进行自动循环调用：
 
 ```python
 import time
@@ -73,6 +73,24 @@ if response.status_code == 429:
     if seconds is not None and seconds.isdigit():
         time.sleep(int(seconds))
 ```
+
+## 下游错误约定
+
+错误约定以字节火山方舟 [Agent / Coding Plan 推理错误码](https://docs.volcengine.com/docs/ark/error-codes?lang=zh)为准。上游 `error.type`、完整 `error.code`（包含点号后缀）、`message`、`param`、请求 ID 和其他原有字段均保持不变，未知错误也不替换成通用错误。保留错误原有 HTTP 状态码，例如 Coding Plan 的 `400 / Forbidden / InvalidSubscription` 不改成 403。
+
+Coding Plan 的 `QuotaExceeded` 与 Agent Plan 的 `QuotaExceeded.AgentPlanQuotaExceeded` 按原样返回；账号切换最终失败时返回最后一次上游错误。内部分类只影响账号调度和管理页，不增加下游字段。SSE 错误事件原样转发，上游已发出明确错误后不追加网关错误；成功响应与 SSE 也保留上游端到端响应头。
+
+没有上游响应可供返回时，网关自身错误沿用方舟错误体结构与 `BadRequest`、`Unauthorized`、`Forbidden`、`TooManyRequests`、`InternalServerError` 等类型。自身错误码使用 `Gateway.` 前缀，例如 `Gateway.invalid_tool_arguments`、`Gateway.plan_pool_cooling_down`；这是网关的错误码，不冒充字节官方错误码，不伪造上游 Request ID。`/v1/` 的鉴权、404 和 405 错误也使用该结构；管理界面 `/api/` 的错误不属于推理协议。
+
+按 [HTTP 代理规则](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1)移除逐跳头及 `Connection` 指定的字段。上游响应经过解压或 SSE 汇总时，不沿用失效的编码、长度或内容校验头。必须进行的适配仅包括账号路由和鉴权、模型别名、上游强制 SSE 的请求方式、非流式汇总及 WebSocket 传输；不重写提示词、工具输出或上游错误含义。
+
+## 原生上下文压缩
+
+`POST /v1/responses/compact` 按 [OpenAI 原生压缩接口](https://developers.openai.com/api/docs/guides/compaction)转发到所选套餐的 `/responses/compact`。仅替换上游鉴权和已配置模型别名，不添加 `stream`、`stream_options` 或摘要提示词，不过滤 reasoning、compaction、空内容或工具历史。上游返回的压缩窗口和错误保持原样；压缩结果 ID 不作为可检索的普通 Response ID 保存。
+
+原生压缩与生成接口中的 `context_management` 均取决于所选字节套餐、模型和上游端点实际支持；网关不模拟加密压缩项，也不自动退回生成接口。上游不支持或参数不符合其要求时，保留原始 400/404 等错误。已验证请求路由与字段保持，尚未验证真实方舟模型的压缩成功率。
+
+`MissingParameter` 只表示上游认为缺少参数，需结合原始 `message`、`param`、请求路径和请求 ID 定位。旧版 `gateway_error / upstream_request_rejected` 封装不能证明具体缺少哪个字段；没有实际请求记录时，不据此补造或修正历史内容。
 
 ## Responses WebSocket
 
@@ -91,13 +109,15 @@ supports_websockets = true
 
 每轮发送顶层 JSON `{"type":"response.create","model":"ark-code-latest","input":"Reply OK"}`。上游 SSE 中的每个 JSON 事件转成一条 WebSocket 文本消息，工具与错误事件保持原内容；HTTP 请求错误使用 WebSocket 的 `type: error`、`status` 外层承载上游原 JSON，不添加 metadata，连接仍可继续使用。反向代理须允许 WebSocket Upgrade。
 
+网关自身 Responses 流错误使用 OpenAI 的顶层 `type/code/message/param/sequence_number`；Chat 流错误使用嵌套 `error`。WS 请求错误使用嵌套 `error` 与 `status`；网关检出的 `invalid_stream_id`、`previous_response_not_found` 遵循 OpenAI 对应协议码和参数字段，其他自身错误使用 `Gateway.` 前缀。预热创建和完成事件带有序号。字节上游错误不会改写为这些网关错误。
+
 这是 WebSocket 到方舟 HTTP/SSE 的桥接。支持同一连接顺序执行多轮、`generate: false` 预热和增量工具输出。预热只在网关内保存请求状态、返回零用量的预热响应，不发起上游生成；下一轮引用该 ID 时合并预热输入。网关在内存中保留该连接最近一次响应的输入和完整 output，`store: false` 续轮会补全上下文后经 HTTP 发送，同时保留原账号绑定。单帧及缓存最大 8 MB，缓存不会写入数据库；断开后缓存消失，未存储的会话应重连并发送完整上下文。
 
 请求按接收顺序执行，最多排队一轮；`stream_id` 可作为事件标签，但不提供并行 lanes、跨 lane 分叉或 mid-turn steering。缓存仅保留最近一轮，其他响应 ID 仍按现有上游存储与账号绑定规则处理。与[OpenAI WebSocket 模式](https://developers.openai.com/api/docs/guides/websocket-mode)的原生服务缓存和加速机制不同，本桥接不保证减少上游 Token 或延迟。已开始输出后的失败不会重放，客户端断开会取消当前转发并释放连接。
 
 ## 额度语义
 
-Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsage`；多限制窗口任一耗尽即冷却，恢复时间取已耗尽窗口最晚重置时间。Coding Plan 配置 AK/SK 后请求[官方 Ark CLI 所用的 `GetCodingPlanUsage`](https://github.com/volcengine/ark-cli/blob/main/skills/arkcli-usage/references/arkcli-usage-plan.md)，展示各窗口官方已用百分比和重置时间。推理 API Key 不能直接查询该管理接口；未配置 AK/SK 时额度显示“未知”，仍根据请求中观察到的套餐耗尽错误切换账号。普通 RPM/TPM 限流独立短退避。无可信重置时间时返回 `plan_quota_exhausted`；有可信时间时返回 `plan_pool_cooling_down` 和 `Retry-After`。
+Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsage`；多限制窗口任一耗尽即冷却，恢复时间取已耗尽窗口最晚重置时间。Coding Plan 配置 AK/SK 后请求[官方 Ark CLI 所用的 `GetCodingPlanUsage`](https://github.com/volcengine/ark-cli/blob/main/skills/arkcli-usage/references/arkcli-usage-plan.md)，展示各窗口官方已用百分比和重置时间。推理 API Key 不能直接查询该管理接口；未配置 AK/SK 时额度显示“未知”，仍根据请求中观察到的套餐耗尽错误切换账号。普通 RPM/TPM 限流独立短退避。没有当前上游响应时，无可信重置时间返回 `Gateway.plan_quota_exhausted`；有可信时间返回 `Gateway.plan_pool_cooling_down` 和 `Retry-After`。
 
 同一套餐下属于同一额度主体的多个密钥可在账号编辑页指定同一个额度主体。不同套餐的同名模型可互为候选；需要别名时，在账号编辑页按 `别名=上游模型` 配置模型映射。`previous_response_id` 始终回到创建它的账号。密钥、提示词、完整上游错误不写入日志；数据库、`.env` 和静态构建物不进入 Git。请备份 `.env` 中的主密钥，否则数据库中的账号密钥无法解密。
 
@@ -119,7 +139,7 @@ Agent Plan 配置对应账号 AK/SK 后，用官方签名 SDK 请求 `GetAFPUsag
 | 其他 5xx、发送结果不明、已接受流式响应后失败 | 当前请求不重放；服务/传输故障对该账号模型短暂退避 |
 | 网关连接池等待超时 | 返回可重试的 503，不隔离上游账号 |
 
-临时服务/连接故障在一次生成请求中最多尝试 3 次，每个账号最多一次；不在请求内等待冷却。切换未成功时返回最后一次上游 HTTP 错误的原状态码与响应体。没有上游 HTTP 错误可供返回时，全部候选不可用返回池状态及可用的 `Retry-After`；达到尝试上限但仍有候选时返回 `503 upstream_failover_exhausted`。额度、鉴权等已明确拒绝的切换不消耗临时故障次数。`previous_response_id` 仍绑定原账号，不跨账号重放。5xx 切换优先保障可用性，但可能产生重复的上游计算或计费，无法保证所有上游故障时调用成功。
+临时服务/连接故障在一次生成请求中最多尝试 3 次，每个账号最多一次；不在请求内等待冷却。切换未成功时返回最后一次上游 HTTP 错误的原状态码与响应体。没有上游 HTTP 错误可供返回时，全部候选不可用返回池状态及可用的 `Retry-After`；达到尝试上限但仍有候选时返回 `503 Gateway.upstream_failover_exhausted`。额度、鉴权等已明确拒绝的切换不消耗临时故障次数。`previous_response_id` 仍绑定原账号，不跨账号重放。5xx 切换优先保障可用性，但可能产生重复的上游计算或计费，无法保证所有上游故障时调用成功。
 
 默认退避按连续失败次数在 10、20、40…300 秒窗口内取 50%–100% 随机延迟；上游有效 `Retry-After` 是最短等待下限，不截短。冷却结束后只允许一个并发请求试探，完整成功才恢复；较早的成功请求不能清除新发生的失败状态。模型隔离、失败次数和冷却会跨重启保留。账号详情展示原因码及恢复时间，手动恢复清除同一额度主体的冷却、模型隔离和鉴权失败状态。
 
@@ -172,6 +192,6 @@ python scripts/import_pricing.py
 
 `InvalidParameter` 属于请求错误：同一请求不切换账号、不自动重放，也不将账号标记为额度冷却。返回 `retryable: false` 和 `requires_request_change: true`。独立的下游重复请求仍是新的请求，客户端必须修正输入后再发起。
 
-网关在发送前检查 Responses `input[].function_call` 和 Chat `messages[].tool_calls` 中完整的函数参数 JSON，发现损坏时返回 `400 invalid_tool_arguments` 及字段位置，不把同一损坏历史继续发送给供应商。不修改工具参数、不伪造工具执行结果，也不校验流式参数片段或 custom 工具的自由格式输入。
+网关在发送前检查 Responses `input[].function_call` 和 Chat `messages[].tool_calls` 中完整的函数参数 JSON，发现损坏时返回 `400 Gateway.invalid_tool_arguments` 及字段位置，不把同一损坏历史继续发送给供应商。不修改工具参数、不伪造工具执行结果，也不校验流式参数片段或 custom 工具的自由格式输入。原生压缩请求不经过该生成历史校验。
 
 Codex 遇到工具解析失败后连续出现 400，需要结合脱敏的供应商错误确认工具历史、调用/结果对应关系或服务端上下文是否有效。网关不会通过切换账号或自动修补 JSON 改变调用语义。

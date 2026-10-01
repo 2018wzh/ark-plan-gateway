@@ -18,6 +18,7 @@ def error(code, message="", **extra):
 @pytest.mark.parametrize("status,code,message,kind", [
     (401, "AuthenticationError", "", "auth"), (401, "MCPInvalidCredential", "", "request"),
     (401, "InvalidAccountStatus", "", "account"),
+    (400, "InvalidSubscription", "", "account"),
     (403, "OperationDenied.ServiceNotOpen", "", "model"),
     (403, "OperationDenied.ServiceOverdue", "", "account"),
     (403, "AccountOverdueError", "", "account"), (403, "AccessDenied", "", "permission"),
@@ -292,7 +293,7 @@ async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, mo
                 response = await client.post(path, headers={'authorization': 'Bearer service-token-123456789012345'},
                                              json={'model': 'm', 'input': 'test', 'messages': [{'role': 'user', 'content': 'test'}]})
                 assert response.status_code == 429
-                assert response.json()['error']['code'] == ('QuotaExceeded' if turn == 0 else 'plan_pool_cooling_down' if known else 'plan_quota_exhausted')
+                assert response.json()['error']['code'] == ('QuotaExceeded' if turn == 0 else 'Gateway.plan_pool_cooling_down' if known else 'Gateway.plan_quota_exhausted')
                 assert 'metadata' not in response.json()['error']
                 if known and turn == 0:
                     assert int(response.headers['retry-after']) == 7200

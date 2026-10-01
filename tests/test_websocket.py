@@ -63,12 +63,13 @@ def setup(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize('stream_error', [False, True])
-def test_websocket_upstream_errors_preserve_payload(setup, stream_error):
+@pytest.mark.parametrize('plan', ['coding', 'agent'])
+def test_websocket_upstream_errors_preserve_payload(setup, stream_error, plan):
     store, create = setup
-    store.add_account('agent', 'a', models=['m'])
-    store.add_account('coding', 'b', models=['m'])
+    store.add_account(plan, 'a', models=['m'])
+    store.add_account(plan, 'b', models=['m'])
     calls = []
-    payload = {'error': {'code': 'MissingParameter', 'message': 'Missing input', 'param': 'input', 'type': 'invalid_request_error'}}
+    payload = {'error': {'code': 'MissingParameter', 'message': 'Missing input', 'param': 'input', 'type': 'BadRequest'}}
     event = {'type': 'error', 'code': 'MissingParameter', 'message': 'Missing input', 'param': 'input'}
     def upstream(request):
         calls.append(request)
@@ -176,7 +177,7 @@ def test_websocket_failover_and_request_scoped_errors(setup):
                       'input': [{'type': 'function_call', 'arguments': '{bad'}]})
         error = ws.receive_json()
         assert error['type'] == 'error' and error['status'] == 400 and error['stream_id'] == 'main'
-        assert error['error']['code'] == 'invalid_tool_arguments' and not calls
+        assert error['error']['code'] == 'Gateway.invalid_tool_arguments' and not calls
         ws.send_json({'type': 'response.create', 'model': 'm', 'input': 'test', 'stream_id': 'main'})
         assert ws.receive_json()['stream_id'] == 'main'
     assert len(calls) == 2 and all('stream_id' not in body for body in calls)
@@ -195,9 +196,13 @@ def test_invalid_frames_do_not_call_upstream(setup, event, code):
     _, client = create(lambda r: calls.append(r))
     with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
         ws.send_json(event)
-        assert ws.receive_json()['error']['code'] == code
+        error = ws.receive_json()
+        assert error['error']['code'] == (code if code in ('invalid_stream_id','previous_response_not_found') else 'Gateway.' + code)
+        assert 'param' in error['error']
+        if code in ('invalid_stream_id','previous_response_not_found'):
+            assert error['error']['type'] == 'invalid_request_error'
         ws.send_text('{invalid json')
-        assert ws.receive_json()['error']['code'] == 'invalid_json'
+        assert ws.receive_json()['error']['code'] == 'Gateway.invalid_json'
     assert not calls
 
 
@@ -229,7 +234,9 @@ def test_incomplete_upstream_is_not_replayed(setup):
     with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
         ws.send_json({'type': 'response.create', 'model': 'm', 'input': 'test'})
         assert ws.receive_json()['delta'] == 'partial'
-        assert ws.receive_json()['error']['code'] == 'upstream_stream_incomplete'
+        error = ws.receive_json()
+        assert error == {'type':'error', 'code':'Gateway.upstream_stream_incomplete',
+                         'message':'Gateway: upstream_stream_incomplete', 'param':None, 'sequence_number':0}
     assert len(calls) == 1 and all(n == 0 for n in app.state.pool.inflight.values())
 
 

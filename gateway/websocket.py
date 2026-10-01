@@ -10,9 +10,10 @@ from contextlib import aclosing
 
 import anyio
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from .protocols import ProtocolError, SSEDecoder
+from .errors import gateway_error
 
 MAX_MESSAGE_BYTES = 8_000_000
 
@@ -88,8 +89,12 @@ async def serve_responses(websocket: WebSocket, validate, generate):
             await websocket.send_json(event)
 
     async def error(code, stream_id=None, status=400):
-        await send({"type": "error", "status": status,
-                    "error": {"type": "gateway_error", "code": code, "message": code, "param": None}}, stream_id)
+        payload = gateway_error(status, code)
+        payload["error"]["param"] = None
+        if code in ("invalid_stream_id", "previous_response_not_found"):
+            payload["error"].update(code=code, type="invalid_request_error",
+                                    param="stream_id" if code == "invalid_stream_id" else "previous_response_id")
+        await send({"type": "error", "status": status, **payload}, stream_id)
 
     async def send_rejection(result, stream_id):
         try:
@@ -97,8 +102,11 @@ async def serve_responses(websocket: WebSocket, validate, generate):
         except (ValueError, UnicodeError):
             payload = None
         if not isinstance(payload, dict):
-            payload = {"error": {"type": "gateway_error", "code": "upstream_rejected",
-                                 "message": result.body.decode("utf-8", errors="replace"), "param": None}}
+            payload = gateway_error(result.status_code, "upstream_rejected",
+                                    message=result.body.decode("utf-8", errors="replace"))
+            payload["error"]["param"] = None
+        elif isinstance(result, JSONResponse) and isinstance(payload.get("error"), dict):
+            payload["error"].setdefault("param", None)
         await send({"type": "error", "status": result.status_code, **payload}, stream_id)
 
     async def process(raw):
@@ -135,8 +143,8 @@ async def serve_responses(websocket: WebSocket, validate, generate):
             history.remember(body, response, stream_id, warmup=True,
                              binding_id=binding_id or body.get("previous_response_id"))
             # This prepares gateway state without issuing a billable generation.
-            await send({"type": "response.created", "response": {**response, "status": "in_progress"}}, stream_id)
-            await send({"type": "response.completed", "response": response}, stream_id)
+            await send({"type": "response.created", "sequence_number": 0, "response": {**response, "status": "in_progress"}}, stream_id)
+            await send({"type": "response.completed", "sequence_number": 1, "response": response}, stream_id)
             return
 
         result = await generate(body, binding_id)
