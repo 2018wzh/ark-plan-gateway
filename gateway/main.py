@@ -16,7 +16,7 @@ from urllib.parse import quote
 
 import httpx
 import anyio
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.staticfiles import StaticFiles
@@ -25,6 +25,7 @@ from .pool import AccountPool, classify_error
 from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments
 from .errors import safe_error_code
 from .store import Store
+from .websocket import serve_responses
 
 AGENT_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 CODING_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
@@ -201,7 +202,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     app.state.pool = pool
     app.state.client = client
 
-    def require_service(request: Request):
+    def require_service(request: Request | WebSocket):
         auth = request.headers.get("authorization", "")
         expected = store._dec(store.setting("service_token"))
         if not hmac.compare_digest(auth, "Bearer " + expected):
@@ -370,7 +371,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         for m in a["models"] if not (pool.model_block(a, m) and pool.model_block(a, m)["retry_at"] is None)})
         return {"object": "list", "data": [{"id": m, "object": "model", "created": 0, "owned_by": "ark-plan-gateway"} for m in names]}
 
-    async def proxy(request: Request, method: str, path: str, body: bytes | None, model: str,
+    async def proxy(request: Request | None, method: str, path: str, body: bytes | None, model: str,
                     pinned: str | None, stream: bool = False):
         chat = path == "/chat/completions"
         attempted: set[str] = set()
@@ -548,7 +549,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 outcome = "client_disconnected"
                 try:
                     async for chunk in upstream.aiter_bytes():
-                        if await request.is_disconnected():
+                        if request is not None and await request.is_disconnected():
                             return error_response(499, "client_disconnected")
                         observe(chunk)
                         if state.failed:
@@ -587,15 +588,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return StreamingResponse(events(), status_code=upstream.status_code, media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    async def create_generation(request: Request, chat: bool):
-        require_service(request)
-        raw = await request.body()
-        if len(raw) > 8_000_000:
-            return error_response(413, "request_too_large")
-        try:
-            data = json.loads(raw)
-        except ValueError:
-            return error_response(400, "invalid_json")
+    def validate_generation(data: object, chat: bool):
         model = data.get("model") if isinstance(data, dict) else None
         if not isinstance(model, str) or not model:
             return error_response(400, "model_required")
@@ -610,7 +603,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 return error_response(400, "messages_required")
             if "stream_options" in data and not isinstance(data["stream_options"], dict):
                 return error_response(400, "invalid_stream_options")
-            return await proxy(request, "POST", "/chat/completions", raw, model, None, data.get("stream", False))
+            return model, None
         if data.get("background"):
             return error_response(400, "background_not_supported")
         prior = data.get("previous_response_id")
@@ -619,11 +612,53 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         pinned = store.lookup_binding(prior) if prior else None
         if prior and not pinned:
             return error_response(404, "previous_response_unknown")
-        return await proxy(request, "POST", "/responses", raw, model, pinned, bool(data.get("stream")))
+        return model, pinned
+
+    async def create_generation(request: Request, chat: bool):
+        require_service(request)
+        raw = await request.body()
+        if len(raw) > 8_000_000:
+            return error_response(413, "request_too_large")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return error_response(400, "invalid_json")
+        validated = validate_generation(data, chat)
+        if isinstance(validated, Response):
+            return validated
+        model, pinned = validated
+        return await proxy(request, "POST", "/chat/completions" if chat else "/responses",
+                           raw, model, pinned, data.get("stream", False))
 
     @app.post("/v1/responses")
     async def responses(request: Request):
         return await create_generation(request, chat=False)
+
+    @app.websocket("/v1/responses")
+    async def websocket_responses(websocket: WebSocket):
+        try:
+            require_service(websocket)
+        except HTTPException:
+            await websocket.close(code=1008)
+            return
+
+        def validate(data):
+            result = validate_generation(data, False)
+            return result if isinstance(result, Response) else None
+
+        async def generate(data, binding_id):
+            validated = validate_generation(data, False)
+            if isinstance(validated, Response):
+                return validated
+            model, pinned = validated
+            if binding_id:
+                pinned = store.lookup_binding(binding_id)
+                if not pinned:
+                    return error_response(404, "previous_response_unknown")
+            raw = json.dumps(data, ensure_ascii=False).encode()
+            return await proxy(None, "POST", "/responses", raw, model, pinned, True)
+
+        await serve_responses(websocket, validate, generate)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):

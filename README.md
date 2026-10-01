@@ -1,6 +1,6 @@
 # Ark Plan Gateway
 
-火山方舟 Agent Plan / Coding Plan 个人版网关。按模型选择可用密钥，在额度耗尽时切换账号；WebUI 提供账号、额度和路由管理。`POST /v1/responses`、`POST /v1/chat/completions` 均支持同步与实时 SSE，`GET /v1/models` 提供 OpenAI 格式的模型列表。
+火山方舟 Agent Plan / Coding Plan 个人版网关。按模型选择可用密钥，在额度耗尽时切换账号；WebUI 提供账号、额度和路由管理。`POST /v1/responses`、`POST /v1/chat/completions` 均支持同步与实时 SSE，`/v1/responses` 还提供 WebSocket 接入，`GET /v1/models` 提供 OpenAI 格式的模型列表。
 
 ## 启动
 
@@ -75,6 +75,27 @@ if response.status_code == 429:
         if seconds is not None:
             time.sleep(seconds)
 ```
+
+## Responses WebSocket
+
+连接 `ws://127.0.0.1:8000/v1/responses`（HTTPS 部署使用 `wss://`），握手携带 `Authorization: Bearer <下游访问令牌>`。Codex 自定义 provider 使用 HTTP Base URL，客户端会自行选择 WebSocket：
+
+```toml
+model_provider = "ark_gateway"
+
+[model_providers.ark_gateway]
+name = "Ark Gateway"
+base_url = "http://127.0.0.1:8000/v1"
+env_key = "ARK_GATEWAY_SERVICE_TOKEN"
+wire_api = "responses"
+supports_websockets = true
+```
+
+每轮发送顶层 JSON `{"type":"response.create","model":"ark-code-latest","input":"Reply OK"}`。上游 SSE 中的每个 JSON 事件转成一条 WebSocket 文本消息，工具事件保持原内容；请求错误返回带 `type: error`、`status` 和原有错误 metadata 的消息，连接仍可继续使用。反向代理须允许 WebSocket Upgrade。
+
+这是 WebSocket 到方舟 HTTP/SSE 的桥接。支持同一连接顺序执行多轮、`generate: false` 预热和增量工具输出。预热只在网关内保存请求状态、返回零用量的预热响应，不发起上游生成；下一轮引用该 ID 时合并预热输入。网关在内存中保留该连接最近一次响应的输入和完整 output，`store: false` 续轮会补全上下文后经 HTTP 发送，同时保留原账号绑定。单帧及缓存最大 8 MB，缓存不会写入数据库；断开后缓存消失，未存储的会话应重连并发送完整上下文。
+
+请求按接收顺序执行，最多排队一轮；`stream_id` 可作为事件标签，但不提供并行 lanes、跨 lane 分叉或 mid-turn steering。缓存仅保留最近一轮，其他响应 ID 仍按现有上游存储与账号绑定规则处理。与[OpenAI WebSocket 模式](https://developers.openai.com/api/docs/guides/websocket-mode)的原生服务缓存和加速机制不同，本桥接不保证减少上游 Token 或延迟。已开始输出后的失败不会重放，客户端断开会取消当前转发并释放连接。
 
 ## 额度语义
 
