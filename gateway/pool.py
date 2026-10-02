@@ -29,6 +29,8 @@ class AccountPool:
 
     def _group_state(self, accounts: list[dict], group: str) -> tuple[str | None, float | None]:
         members = [a for a in accounts if a["quota_group"] == group]
+        if any(a["cooldown_kind"] == "account" for a in members):
+            return "invalid", None
         quota = [a for a in members if a["cooldown_kind"] == "quota"]
         if quota:
             values = [a["cooldown_until"] for a in quota]
@@ -91,12 +93,20 @@ class AccountPool:
                                              (order[entry[0]["id"]] - self.sequence) % max(len(accounts), 1)))
             return [a for a, _, _ in eligible]
 
-    async def reserve(self, account: dict, model: str | None = None) -> bool:
+    async def reserve(self, account: dict, model: str | None = None, allow_held: bool = False) -> bool:
         async with self.lock:
-            current = self.store.account(account["id"])
+            current = self.store.account(account["id"], private=True)
             if not current:
                 return False
             model = model or account["models"][0]
+            if model not in current["models"] or current["auth_failed"] or not current["enabled"]:
+                return False
+            account.clear()
+            account.update(current)
+            if allow_held:
+                account["_probe_keys"] = set()
+                self.inflight[account["id"]] = self.inflight.get(account["id"], 0) + 1
+                return True
             keys = self._keys(current, model)
             if keys & self.probing or not current["enabled"]:
                 return False
@@ -124,15 +134,19 @@ class AccountPool:
             self.probing.difference_update(account.get("_probe_keys", set()))
 
     def update_result(self, account: dict, kind: str, until: float | None, model: str | None = None, code: str = "UnknownUpstreamError"):
+        current = self.store.account(account["id"], private=True)
+        if not current or ("key_hash" in account and account["key_hash"] != current["key_hash"]) or account["quota_group"] != current["quota_group"]:
+            return
         model = model or account["models"][0]
         now = time.time()
         if kind == "quota":
-            for a in self.store.accounts():
-                if a["quota_group"] == account["quota_group"]:
+            members = [a for a in self.store.accounts() if a["quota_group"] == account["quota_group"] and a["cooldown_kind"] != "account"]
+            for a in members:
+                if a["cooldown_kind"] == "quota":
                     # Concurrent failures cannot shorten a known later reset.
-                    if a["cooldown_kind"] == "quota":
-                        until = max(until, a["cooldown_until"]) if until is not None and a["cooldown_until"] is not None else None
-                    self.store.update(a["id"], cooldown_kind="quota", cooldown_until=until, cooldown_code=code)
+                    until = max(until, a["cooldown_until"]) if until is not None and a["cooldown_until"] is not None else None
+            for a in members:
+                self.store.update(a["id"], cooldown_kind="quota", cooldown_until=until, cooldown_code=code)
         elif kind == "rate":
             members = [a for a in self.store.accounts() if a["quota_group"] == account["quota_group"]]
             failures = max(a["cooldown_failures"] for a in members)

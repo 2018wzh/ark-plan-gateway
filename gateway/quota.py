@@ -17,20 +17,31 @@ AGENT_MANAGEMENT_HOST = "ark.cn-beijing.volcengineapi.com"
 CODING_MANAGEMENT_HOST = "open.volcengineapi.com"
 
 
+def reset_timestamp(value, milliseconds=False):
+    try:
+        if isinstance(value, bool):
+            return None
+        stamp = float(value)
+        if milliseconds or stamp > 1e11:
+            stamp /= 1000
+        return stamp if math.isfinite(stamp) and 0 < stamp < 253402300799 else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def parse_coding_usage(result: dict) -> dict:
     usage = {}
-    for item in result.get("QuotaUsage", []):
+    items = result.get("QuotaUsage")
+    for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict) or item.get("Level") not in ("session", "weekly", "monthly"):
             continue
         try:
             percent = float(item["Percent"])
             if not math.isfinite(percent) or percent < 0 or percent > 100:
                 continue
-            raw_reset = float(item.get("ResetTimestamp", -1))
-            reset_time = (raw_reset / 1000 if raw_reset > 1e11 else raw_reset) if raw_reset > 0 else None
         except (ValueError, TypeError, KeyError):
             continue
-        usage[item["Level"]] = {"quota": 100.0, "used": percent, "reset_time": reset_time, "unit": "percent"}
+        usage[item["Level"]] = {"quota": 100.0, "used": percent, "reset_time": reset_timestamp(item.get("ResetTimestamp")), "unit": "percent"}
     return usage
 
 
@@ -79,19 +90,29 @@ async def refresh_account(store: Store, account: dict) -> None:
         return
     now = time.time()
     try:
+        action = "GetAFPUsage" if account["plan"] == "agent" else "GetCodingPlanUsage"
+        result = await management_call(action, account["access_key"], account["secret_key"], {})
+        current = store.account(account["id"], private=True)
+        if not current or any(current[field] != account[field] for field in ("access_key", "secret_key", "quota_group")):
+            return
+        now = time.time()
         if account["plan"] == "agent":
-            result = await management_call("GetAFPUsage", account["access_key"], account["secret_key"], {})
             usage = {}
             for key in ("AFPFiveHour", "AFPDaily", "AFPWeekly", "AFPMonthly"):
                 item = result.get(key)
                 if not isinstance(item, dict) or "Quota" not in item:
                     continue
-                usage[key] = {"quota": float(item["Quota"]), "used": float(item["Used"]),
-                              "reset_time": float(item["ResetTime"]) / 1000 if item.get("ResetTime") else None, "unit": "afp"}
+                try:
+                    quota, used = float(item["Quota"]), float(item["Used"])
+                    if not all(math.isfinite(value) and value >= 0 for value in (quota, used)):
+                        continue
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    continue
+                usage[key] = {"quota": quota, "used": used,
+                              "reset_time": reset_timestamp(item.get("ResetTime"), milliseconds=True), "unit": "afp"}
             if not usage:
                 raise RuntimeError("empty AFP usage")
             # Partial snapshots must not forget a previously exhausted window.
-            current = store.account(account["id"])
             for key, window in current.get("usage", {}).items():
                 if key not in usage and exhausted_windows({key: window}):
                     usage[key] = window
@@ -101,12 +122,10 @@ async def refresh_account(store: Store, account: dict) -> None:
                     state.update(quota_cooldown_state(member, usage, now, "QuotaExceeded.AgentPlanQuotaExceeded"))
                     store.update(member["id"], **state)
         else:
-            result = await management_call("GetCodingPlanUsage", account["access_key"], account["secret_key"], {})
             usage = parse_coding_usage(result)
             if not usage:
                 raise RuntimeError("empty Coding Plan usage")
             # Partial snapshots must not forget a previously exhausted window.
-            current = store.account(account["id"])
             for key, window in current.get("usage", {}).items():
                 if key not in usage and exhausted_windows({key: window}):
                     usage[key] = window

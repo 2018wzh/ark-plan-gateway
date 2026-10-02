@@ -234,12 +234,14 @@ async def test_admin_resume_and_model_discovery(store, monkeypatch):
             failed = await client.post('/v1/responses', headers=headers, json={'model':'m','input':'test'})
             assert 'metadata' not in failed.json()['error']
             assert failed.status_code >= 400
+            store.update(aid, expired=1)
             await client.post('/api/login', json={'password': 'test-password-123'})
             edited = await client.patch(f'/api/accounts/{aid}', json={'label': 'renamed', 'models': ['m','other'], 'model_mapping': {}, 'api_key': None})
             assert edited.status_code == 200 and len(edited.json()['model_blocks']) == 1
             assert (await client.post(f'/api/accounts/{aid}/resume')).status_code == 200
             assert [m['id'] for m in (await client.get('/v1/models', headers=headers)).json()['data']] == ['m', 'other']
             assert store.account(aid)['model_blocks'] == []
+            assert store.account(aid)['expired'] == 0
 
 
 @pytest.mark.asyncio
@@ -379,3 +381,79 @@ async def test_exhausted_daily_without_valid_reset_never_probes(store, monkeypat
     assert account['quota_error'] is None
     assert account['cooldown_kind'] == 'quota' and account['cooldown_until'] is None
     assert not await AccountPool(store).candidates('m')
+
+
+@pytest.mark.asyncio
+async def test_reservation_refreshes_credentials_and_stale_failure_is_ignored(store):
+    aid = store.add_account('agent', 'old', models=['m'])
+    pool = AccountPool(store)
+    selected = (await pool.candidates('m'))[0]
+    store.update(aid, api_key='new')
+    assert await pool.reserve(selected, 'm') and selected['api_key'] == 'new'
+    store.update(aid, api_key='newer')
+    pool.update_result(selected, 'auth', None, 'm', 'AuthenticationError')
+    assert not store.account(aid)['auth_failed']
+    await pool.release(selected)
+    with store.lock, store.db:
+        store.db.execute('DELETE FROM accounts WHERE id=?', (aid,))
+    pool.update_result(selected, 'server', None, 'm')
+    assert not await pool.reserve(selected, 'm') and not pool.probing
+
+
+@pytest.mark.asyncio
+async def test_removed_model_cannot_be_reserved_from_old_candidates(store):
+    aid = store.add_account('agent', 'key', models=['m'])
+    pool = AccountPool(store)
+    selected = (await pool.candidates('m'))[0]
+    store.update(aid, models=['other'])
+    assert not await pool.reserve(selected, 'm')
+
+
+def test_quota_group_preserves_account_hold_and_aggregates_before_writing(store):
+    ids = [store.add_account('agent', str(i), models=['m']) for i in range(3)]
+    for aid in ids:
+        store.set_quota_group(aid, 'shared')
+    store.update(ids[0], cooldown_kind='account', cooldown_code='InvalidSubscription')
+    store.update(ids[2], cooldown_kind='quota', cooldown_until=time.time()+7200)
+    pool = AccountPool(store)
+    pool.update_result(store.account(ids[1]), 'quota', time.time()+3600, 'm', 'AccountQuotaExceeded')
+    assert store.account(ids[0])['cooldown_kind'] == 'account'
+    assert store.account(ids[1])['cooldown_until'] == store.account(ids[2])['cooldown_until']
+
+
+@pytest.mark.asyncio
+async def test_new_group_member_inherits_account_hold(store):
+    first = store.add_account('agent', 'first', models=['m'])
+    pool = AccountPool(store)
+    pool.update_result(store.account(first), 'account', None, 'm', 'InvalidSubscription')
+    new = store.add_account('agent', 'new', models=['m'])
+    store.set_quota_group(new, first)
+    assert not await pool.candidates('m')
+    assert not await pool.reserve(store.account(new), 'm')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('bad', [float('nan'), float('inf'), -1, 'bad', None])
+async def test_invalid_afp_snapshot_does_not_clear_quota_hold(store, monkeypatch, bad):
+    from gateway import quota
+    aid = store.add_account('agent', 'key', models=['m'])
+    store.update(aid, access_key='ak', secret_key='sk', cooldown_kind='quota', cooldown_until=None)
+    async def usage(*args):
+        return {'AFPFiveHour': {'Quota': bad, 'Used': 0, 'ResetTime': 0}}
+    monkeypatch.setattr(quota, 'management_call', usage)
+    await quota.refresh_account(store, store.account(aid, True))
+    assert store.account(aid)['cooldown_kind'] == 'quota'
+    assert store.account(aid)['quota_error']
+
+
+@pytest.mark.asyncio
+async def test_quota_query_cannot_write_to_a_group_changed_during_request(store, monkeypatch):
+    from gateway import quota
+    aid = store.add_account('agent', 'key', models=['m'])
+    store.update(aid, access_key='ak', secret_key='sk')
+    async def usage(*args):
+        store.set_quota_group(aid, 'new-group')
+        return {'AFPFiveHour': {'Quota':10, 'Used':10, 'ResetTime':int((time.time()+600)*1000)}}
+    monkeypatch.setattr(quota, 'management_call', usage)
+    await quota.refresh_account(store, store.account(aid, True))
+    assert store.account(aid)['usage'] == {} and store.account(aid)['cooldown_kind'] is None

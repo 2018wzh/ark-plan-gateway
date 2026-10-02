@@ -44,7 +44,7 @@ KNOWN_CODES = MODEL_ERRORS | ACCOUNT_ERRORS | OVERLOAD_ERRORS | RATE_ERRORS | {
 def error_data(body: bytes) -> tuple[dict, dict]:
     try:
         data = json.loads(body[:65536])
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError, RecursionError):
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -90,7 +90,7 @@ def reset_from_error(data: dict, now: float) -> float | None:
     error = data.get("error") if isinstance(data.get("error"), dict) else {}
     raw = data.get("reset_time") or data.get("resetTime") or error.get("reset_time") or error.get("resetTime")
     if raw is None:
-        match = re.search(r"(?:reset(?:s| at)?|恢复(?:于|时间)?)[^\d]{0,12}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\s*(?:Z|[+-]\d{2}:?\d{2}))?|\d{10,13})",
+        match = re.search(r"(?:reset(?:s| at)?|恢复(?:于|时间)?)[^\d]{0,12}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s*(?:Z|[+-]\d{2}:?\d{2}))?|\d{10,13})",
                           str(error.get("message", "")), re.I)
         raw = match.group(1) if match else None
     try:

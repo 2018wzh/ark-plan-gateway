@@ -8,6 +8,18 @@ class ProtocolError(ValueError):
     pass
 
 
+def request_json(raw: bytes | str):
+    def reject_constant(value):
+        raise ValueError("non-finite JSON value")
+    try:
+        value = json.loads(raw, parse_constant=reject_constant)
+        # Reject escaped lone surrogates before reserving an upstream account.
+        json.dumps(value, ensure_ascii=False).encode("utf-8")
+        return value
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ProtocolError("invalid_json") from exc
+
+
 def invalid_tool_arguments(data: dict, chat: bool) -> str | None:
     """Validate complete function-call history, never partial streaming deltas."""
     def reject_constant(value):
@@ -51,12 +63,26 @@ class SSEDecoder:
         self.data: list[bytes] = []
         self.size = 0
         self.event_type: str | None = None
+        self.started = False
 
     def feed(self, chunk: bytes):
         self.buffer += chunk
-        while b"\n" in self.buffer:
-            line, self.buffer = self.buffer.split(b"\n", 1)
-            line = line.removesuffix(b"\r")
+        if not self.started:
+            if len(self.buffer) < 3 and b"\xef\xbb\xbf".startswith(self.buffer):
+                return
+            self.buffer = self.buffer.removeprefix(b"\xef\xbb\xbf")
+            self.started = True
+        while True:
+            endings = [i for i in (self.buffer.find(b"\r"), self.buffer.find(b"\n")) if i >= 0]
+            if not endings:
+                break
+            end = min(endings)
+            line, separator, rest = self.buffer[:end], self.buffer[end:end+1], self.buffer[end+1:]
+            if separator == b"\r":
+                if not rest:
+                    break  # Wait to distinguish a split CRLF from a bare CR.
+                rest = rest.removeprefix(b"\n")
+            self.buffer = rest
             if not line:
                 if self.data:
                     data = b"\n".join(self.data)
@@ -66,8 +92,8 @@ class SSEDecoder:
                         yield None
                     else:
                         try:
-                            event = json.loads(data)
-                        except (ValueError, UnicodeError) as exc:
+                            event = request_json(data)
+                        except (ValueError, UnicodeError, RecursionError) as exc:
                             raise ProtocolError("invalid_sse_json") from exc
                         if not isinstance(event, dict):
                             raise ProtocolError("invalid_sse_event")
@@ -76,17 +102,27 @@ class SSEDecoder:
                         yield event
                 self.event_type = None
             elif line.startswith(b"event:"):
-                self.event_type = line[6:].strip().decode("utf-8")
+                try:
+                    value = line[6:]
+                    if value.startswith(b" "):
+                        value = value[1:]
+                    self.event_type = value.decode("utf-8")
+                except UnicodeError as exc:
+                    raise ProtocolError("invalid_sse_event") from exc
             elif line.startswith(b"data:"):
                 value = line[5:]
                 if value.startswith(b" "):
                     value = value[1:]
                 self.data.append(value)
                 self.size += len(value)
-            if self.size + len(self.buffer.split(b"\n", 1)[0]) > 8_000_000:
+            if self.size > 8_000_000:
                 raise ProtocolError("upstream_event_too_large")
         if self.size + len(self.buffer) > 8_000_000:
             raise ProtocolError("upstream_event_too_large")
+
+    def finish(self):
+        if self.buffer.endswith(b"\r"):
+            yield from self.feed(b"\n")
 
 
 class StreamResult:

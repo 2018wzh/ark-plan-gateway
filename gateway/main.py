@@ -22,7 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
-from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments
+from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments, request_json
 from .errors import gateway_error, safe_error_code
 from .store import Store
 from .websocket import serve_responses
@@ -329,7 +329,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             raise HTTPException(404, "account not found")
         for a in store.accounts():
             if a["quota_group"] == account["quota_group"]:
-                store.update(a["id"], cooldown_kind=None, cooldown_until=None, cooldown_failures=0, cooldown_code=None, auth_failed=0)
+                store.update(a["id"], cooldown_kind=None, cooldown_until=None, cooldown_failures=0, cooldown_code=None, auth_failed=0, expired=0)
                 store.clear_model_blocks(a["id"])
         return store.account(account_id)
 
@@ -392,15 +392,23 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return {"object": "list", "data": [{"id": m, "object": "model", "created": 0, "owned_by": "ark-plan-gateway"} for m in names]}
 
     async def proxy(request: Request | None, method: str, path: str, body: bytes | None, model: str,
-                    pinned: str | None, stream: bool = False):
+                    pinned: str | None, stream: bool = False, allow_unpin: bool = False):
         chat = path == "/chat/completions"
         generation = method == "POST" and path in ("/responses", "/chat/completions")
         attempted: set[str] = set()
         last_response = None
         transient_failures = 0
         while True:
-            candidates = await pool.candidates(model, pinned, attempted)
+            if method != "POST":
+                bound = store.account(pinned, private=True) if pinned and pinned not in attempted else None
+                candidates = [bound] if bound else []
+            else:
+                candidates = await pool.candidates(model, pinned, attempted)
             if not candidates:
+                if pinned and allow_unpin:
+                    pinned = None
+                    allow_unpin = False
+                    continue
                 if last_response is not None:
                     return last_response
                 status, code, retry_at, _ = pool.unavailable(model, pinned)
@@ -411,7 +419,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 return error_response(503, "upstream_failover_exhausted")
             account = candidates[0]
             attempted.add(account["id"])
-            if not await pool.reserve(account, model):
+            if not await pool.reserve(account, model, allow_held=method != "POST"):
                 continue
             started = time.monotonic()
             started_at = time.time()
@@ -449,7 +457,6 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 upstream = await client.send(req, stream=True)
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 record("connection_error")
-                last_response = None
                 if method == "POST":
                     pool.update_result(account, "server", None, model)
                 with anyio.CancelScope(shield=True):
@@ -481,7 +488,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         await upstream.aclose()
                     finally:
                         await pool.release(account)
-            if upstream.status_code >= 400:
+            if upstream.status_code >= 300:
                 try:
                     raw = await upstream.aread()
                 except (httpx.TimeoutException, httpx.TransportError):
@@ -514,15 +521,24 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 try:
                     if stream:
                         record("response_error")
+                        if method == "POST":
+                            pool.update_result(account, "server", None, model)
                         return error_response(502, "upstream_stream_expected")
                     raw = await upstream.aread()
+                    if method != "POST":
+                        return forward_response_headers(Response(content=raw, status_code=upstream.status_code), upstream)
                     data = json.loads(raw)
+                    if isinstance(data, dict) and (data.get("error") or data.get("status") == "failed"):
+                        kind, until = classify_error(500, raw, upstream.headers, time.time())
+                        pool.update_result(account, kind, until, model, safe_error_code(raw))
+                        record(kind, data)
+                        return forward_response_headers(Response(content=raw, status_code=upstream.status_code), upstream)
                     if path == "/responses" and isinstance(data, dict) and data.get("id"):
                         store.bind(data["id"], account["id"])
                     record("success", data)
                     return forward_response_headers(Response(content=raw, status_code=upstream.status_code,
                                     media_type=upstream.headers.get("content-type", "application/json")), upstream)
-                except (httpx.TimeoutException, httpx.TransportError, ValueError):
+                except (httpx.TimeoutException, httpx.TransportError, ValueError, RecursionError):
                     record("response_error")
                     if method == "POST":
                         pool.update_result(account, "server", None, model)
@@ -535,11 +551,13 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             stream_error: dict = {}
             last_sequence_number = -1
 
-            def observe(chunk: bytes):
+            def observe(chunk: bytes, final: bool = False):
                 nonlocal last_sequence_number
-                for obj in decoder.feed(chunk):
+                for obj in decoder.finish() if final else decoder.feed(chunk):
                     state.observe(obj)
                     if obj is None:
+                        if state.done:
+                            break
                         continue
                     sequence = obj.get("sequence_number")
                     if isinstance(sequence, int) and not isinstance(sequence, bool):
@@ -552,12 +570,16 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         if not error and isinstance(response_obj, dict):
                             error = response_obj.get("error")
                         if not error and obj.get("type") == "error":
-                            error = {"code": obj.get("code"), "message": obj.get("message")}
+                            error = {k: v for k, v in obj.items() if k not in ("type", "sequence_number", "stream_id")}
                         raw_error = json.dumps({"error": error}).encode()
-                        kind, until = classify_error(500, raw_error, {}, time.time())
+                        status = obj.get("status", 500)
+                        status = status if isinstance(status, int) and not isinstance(status, bool) and 400 <= status <= 599 else 500
+                        kind, until = classify_error(status, raw_error, upstream.headers, time.time())
                         code = safe_error_code(raw_error)
                         stream_error.update(obj)
                         pool.update_result(account, kind, until, model, code)
+                    if state.done or state.failed:
+                        break
 
             if not stream:
                 outcome = "client_disconnected"
@@ -568,6 +590,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         observe(chunk)
                         if state.failed:
                             raise ProtocolError("upstream_stream_failed")
+                        if state.done:
+                            break
+                    if not state.done and not state.failed:
+                        observe(b"", final=True)
                     data = state.result()
                     outcome = "success"
                     return forward_response_headers(JSONResponse(data, status_code=upstream.status_code), upstream, transformed=True)
@@ -579,8 +605,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         return forward_response_headers(JSONResponse(stream_error, status_code=502), upstream, transformed=True)
                     return error_response(502, "upstream_stream_incomplete")
                 finally:
-                    record(outcome, state.usage_response)
-                    await close_upstream()
+                    try:
+                        record(outcome, state.usage_response)
+                    finally:
+                        await close_upstream()
 
             def failure_event(code):
                 if chat:
@@ -595,7 +623,13 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 try:
                     async for chunk in upstream.aiter_bytes():
                         observe(chunk)
+                        if state.done or state.failed:
+                            outcome = "stream_error" if state.failed else "success"
                         yield chunk
+                        if state.done or state.failed:
+                            break
+                    if not state.done and not state.failed:
+                        observe(b"", final=True)
                     outcome = "stream_error" if state.failed or not state.done else "success"
                     if not state.failed and not state.done:
                         pool.update_result(account, "server", None, model)
@@ -606,8 +640,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         pool.update_result(account, "server", None, model)
                         yield failure_event("upstream_stream_interrupted")
                 finally:
-                    record(outcome, state.usage_response)
-                    await close_upstream()
+                    try:
+                        record(outcome, state.usage_response)
+                    finally:
+                        await close_upstream()
 
             return forward_response_headers(StreamingResponse(events(), status_code=upstream.status_code, media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}), upstream)
@@ -645,8 +681,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         if len(raw) > 8_000_000:
             return error_response(413, "request_too_large")
         try:
-            data = json.loads(raw)
-        except ValueError:
+            data = request_json(raw)
+        except ProtocolError:
             return error_response(400, "invalid_json")
         validated = validate_generation(data, chat, compact)
         if isinstance(validated, Response):
@@ -685,7 +721,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 if not pinned:
                     return error_response(404, "previous_response_unknown")
             raw = json.dumps(data, ensure_ascii=False).encode()
-            return await proxy(None, "POST", "/responses", raw, model, pinned, True)
+            return await proxy(None, "POST", "/responses", raw, model, pinned, True,
+                               allow_unpin=bool(binding_id and not data.get("previous_response_id")))
 
         await serve_responses(websocket, validate, generate)
 

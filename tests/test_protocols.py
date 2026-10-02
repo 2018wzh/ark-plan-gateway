@@ -49,6 +49,170 @@ class BytesStream(httpx.AsyncByteStream):
         self.closed = True
 
 
+@pytest.mark.parametrize('ending', [b'\n', b'\r\n', b'\r'])
+def test_sse_bom_and_line_endings_at_every_chunk_boundary(ending):
+    expected = {'type': 'response.completed', 'response': {'id': 'resp_ok', 'status': 'completed', 'output': []}}
+    payload = b'\xef\xbb\xbf' + b'event: response.completed' + ending + b'data: ' + json.dumps(expected).encode() + ending * 2
+    for size in (1, 2, 3, 7, len(payload)):
+        decoder = SSEDecoder()
+        events = []
+        for start in range(0, len(payload), size):
+            events.extend(decoder.feed(payload[start:start+size]))
+        events.extend(decoder.finish())
+        assert events == [expected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('stream', [False, True])
+async def test_terminal_response_closes_upstream_before_later_read_failure(setup, stream):
+    store, create_app = setup
+    aid = store.add_account('agent', 'key', models=['m'])
+    terminal = {'id': 'resp_ok', 'status': 'completed', 'output': []}
+    payload = sse({'type': 'response.completed', 'response': terminal})
+    source = BytesStream(payload, fail=True)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, stream=source, headers={'content-type': 'text/event-stream'}))) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model': 'm', 'input': 'test', 'stream': stream})
+    assert response.status_code == 200
+    assert response.content == payload if stream else response.json() == terminal
+    assert source.closed and app.state.pool.inflight[aid] == 0
+    assert store.account(aid)['model_blocks'] == []
+
+
+@pytest.mark.asyncio
+async def test_flat_stream_quota_error_preserves_reset_and_does_not_replay(setup):
+    store, create_app = setup
+    aid = store.add_account('coding', 'key', models=['m'])
+    reset = time.time() + 3600
+    event = {'type': 'error', 'code': 'AccountQuotaExceeded', 'message': 'quota exhausted',
+             'param': '', 'reset_time': reset, 'sequence_number': 3}
+    payload = sse(event)
+    source = BytesStream(payload)
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(200, stream=source, headers={'content-type': 'text/event-stream'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model': 'm', 'input': 'test', 'stream': True})
+    assert response.content == payload and len(calls) == 1
+    assert store.account(aid)['cooldown_kind'] == 'quota' and store.account(aid)['cooldown_until'] == reset
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('method,status,body', [('GET', 200, b'{"id":"resp_stored"}'), ('DELETE', 204, b'')])
+async def test_stored_response_access_survives_generation_quota_hold(setup, method, status, body):
+    store, create_app = setup
+    aid = store.add_account('agent', 'key', models=['m'])
+    store.bind('resp_stored', aid)
+    store.update(aid, cooldown_kind='quota', cooldown_until=None)
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(status, content=body, headers={'x-request-id': 'stored-query'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.request(method, '/v1/responses/resp_stored', headers=AUTH)
+    assert response.status_code == status and response.content == body and len(calls) == 1
+    assert response.headers['x-request-id'] == 'stored-query'
+    assert store.account(aid)['cooldown_kind'] == 'quota' and app.state.pool.inflight[aid] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('raw', [b'{"model":"m","input":NaN}', b'{"model":"m","input":"\\ud800"}',
+                               b'{"model":"m","input":' + b'['*10000 + b'0' + b']'*10000 + b'}'], ids=['nan', 'surrogate', 'deep'])
+@pytest.mark.parametrize('path', ['/v1/responses', '/v1/chat/completions', '/v1/responses/compact'])
+async def test_invalid_json_never_reserves_or_calls_upstream(setup, raw, path):
+    store, create_app = setup
+    store.add_account('agent', 'key', models=['m'])
+    def upstream(request):
+        pytest.fail('invalid JSON must not reach upstream')
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post(path, headers=AUTH, content=raw)
+    assert response.status_code == 400 and response.json()['error']['code'] == 'Gateway.invalid_json'
+    assert not app.state.pool.inflight
+
+
+@pytest.mark.asyncio
+async def test_last_upstream_error_survives_later_connection_failure(setup):
+    store, create_app = setup
+    for plan in ('agent', 'coding'):
+        store.add_account(plan, plan, models=['m'])
+    raw = b'{"error":{"code":"InternalServiceError","message":"original"}}'
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(503, content=raw, headers={'retry-after': '30'})
+        raise httpx.ConnectError('not connected', request=request)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model': 'm', 'input': 'test'})
+    assert response.status_code == 503 and response.content == raw and len(calls) == 2
+    assert response.headers['retry-after'] == '30'
+
+
+@pytest.mark.asyncio
+async def test_upstream_redirect_is_preserved_without_following_or_quarantining(setup):
+    store, create_app = setup
+    aid = store.add_account('agent', 'key', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(307, content=b'redirect', headers={'location':'https://example.invalid/responses'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model':'m', 'input':'test'})
+    assert response.status_code == 307 and response.content == b'redirect' and len(calls) == 1
+    assert response.headers['location'] == 'https://example.invalid/responses'
+    assert not store.account(aid)['model_blocks'] and app.state.pool.inflight[aid] == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_frame_is_authoritative_before_invalid_trailing_frame(setup):
+    store, create_app = setup
+    aid = store.add_account('agent', 'key', models=['m'])
+    terminal = {'id':'resp_done', 'status':'completed', 'output':[]}
+    payload = sse({'type':'response.completed', 'response':terminal}) + b'data: broken\r\r'
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, content=payload, headers={'content-type':'text/event-stream'}))) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/responses', headers=AUTH, json={'model':'m', 'input':'test'})
+    assert response.status_code == 200 and response.json() == terminal
+    assert not store.account(aid)['model_blocks'] and app.state.pool.inflight[aid] == 0
+
+
+@pytest.mark.asyncio
+async def test_upstream_ignores_stream_is_not_replayed_but_next_request_uses_healthy_account(setup):
+    store, create_app = setup
+    for plan in ('agent', 'coding'):
+        store.add_account(plan, plan, models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        if len(calls) == 1:
+            return httpx.Response(200, json={'id':'resp_accepted', 'status':'completed', 'output':[]})
+        return httpx.Response(200, content=sse({'type':'response.completed', 'response':{
+            'id':'resp_healthy', 'status':'completed', 'output':[]}}), headers={'content-type':'text/event-stream'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            failed = await client.post('/v1/responses', headers=AUTH, json={'model':'m', 'input':'test', 'stream':True})
+            assert failed.status_code == 502 and len(calls) == 1
+            recovered = await client.post('/v1/responses', headers=AUTH, json={'model':'m', 'input':'test', 'stream':True})
+            assert recovered.status_code == 200 and b'resp_healthy' in recovered.content
+    assert len(calls) == 2 and calls[0].headers['authorization'] != calls[1].headers['authorization']
+    assert all(n == 0 for n in app.state.pool.inflight.values())
+
+
 def chat_events():
     def event(choices, **extra):
         return {"id": "chatcmpl_test", "object": "chat.completion.chunk", "created": 123, "model": MODEL, "choices": choices, **extra}

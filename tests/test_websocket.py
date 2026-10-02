@@ -270,3 +270,128 @@ def test_real_websocket_upgrade_and_json_frames(setup):
         thread.join(timeout=5)
         listener.close()
     assert not thread.is_alive() and len(calls) == 1
+
+
+def test_named_lanes_run_independently_and_burst_stays_fifo(setup):
+    store, create = setup
+    store.add_account('agent', 'key', models=['m'])
+    release = threading.Event()
+    calls = []
+    class SlowStream(EventStream):
+        async def __aiter__(self):
+            yield b'data: {"type":"response.created","response":{"id":"slow"}}\n\n'
+            while not release.is_set():
+                await asyncio.sleep(.005)
+            async for chunk in super().__aiter__():
+                yield chunk
+    def upstream(request):
+        value = json.loads(request.content)['input']
+        calls.append(value)
+        source = SlowStream([completed('resp_slow')]) if value == 'slow' else EventStream([completed('resp_' + value)])
+        return httpx.Response(200, stream=source, headers={'content-type': 'text/event-stream'})
+    app, client = create(upstream)
+    timer = threading.Timer(3, release.set)
+    timer.start()
+    try:
+        with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
+            ws.send_json({'type':'response.create', 'model':'m', 'input':'slow', 'stream_id':'slow'})
+            assert ws.receive_json()['type'] == 'response.created'
+            for i in range(10):
+                ws.send_json({'type':'response.create', 'model':'m', 'input':str(i), 'stream_id':'fast'})
+            for i in range(10):
+                event = ws.receive_json()
+                assert event['stream_id'] == 'fast' and event['response']['id'] == 'resp_' + str(i)
+            release.set()
+            assert ws.receive_json()['response']['id'] == 'resp_slow'
+    finally:
+        release.set()
+        timer.cancel()
+    assert calls == ['slow'] + [str(i) for i in range(10)]
+    assert not app.state.pool.probing and all(n == 0 for n in app.state.pool.inflight.values())
+
+
+def test_stream_limit_default_lane_and_idle_lanes_do_not_hold_capacity(setup):
+    store, create = setup
+    store.add_account('agent', 'key', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(200, stream=EventStream([completed()]), headers={'content-type':'text/event-stream'})
+    _, client = create(upstream)
+    with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
+        for i in range(32):
+            ws.send_json({'type':'response.create', 'model':'m', 'input':'test', 'stream_id':str(i)})
+            assert ws.receive_json()['stream_id'] == str(i)
+        ws.send_json({'type':'response.create', 'model':'m', 'input':'test', 'stream_id':'33'})
+        event = ws.receive_json()
+        assert event['error']['code'] == 'websocket_stream_limit_reached' and event['stream_id'] == '33'
+        ws.send_json({'type':'response.create', 'model':'m', 'input':'test'})
+        assert 'stream_id' not in ws.receive_json()
+        ws.send_json({'type':'response.create', 'model':'m', 'input':'test', 'stream_id':'0'})
+        assert ws.receive_json()['stream_id'] == '0'
+    assert len(calls) == 34
+
+
+def test_concurrency_limit_and_disconnect_cancel_active_and_queued_lanes(setup):
+    store, create = setup
+    store.add_account('agent', 'key', models=['m'])
+    sources = []
+    def upstream(request):
+        source = EventStream([{'type':'response.created', 'response':{'id':'resp_' + str(len(sources))}}], block=True)
+        sources.append(source)
+        return httpx.Response(200, stream=source, headers={'content-type':'text/event-stream'})
+    app, client = create(upstream)
+    with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
+        for i in range(17):
+            ws.send_json({'type':'response.create', 'model':'m', 'input':'test', 'stream_id':str(i)})
+        for _ in range(16):
+            assert ws.receive_json()['type'] == 'response.created'
+        assert len(sources) == 16 and sum(app.state.pool.inflight.values()) == 16
+    assert len(sources) == 16 and all(source.closed.wait(1) for source in sources)
+    assert not app.state.pool.probing and all(n == 0 for n in app.state.pool.inflight.values())
+
+
+def test_cross_lane_fork_and_cached_continuation_can_fail_over_when_account_is_held(setup):
+    store, create = setup
+    for plan in ('agent', 'coding'):
+        store.add_account(plan, plan, models=['m'])
+    calls = []
+    output = [{'role':'assistant', 'content':'answer'}]
+    def upstream(request):
+        calls.append((request.headers['authorization'], json.loads(request.content)))
+        return httpx.Response(200, stream=EventStream([completed('resp_' + str(len(calls)), output)]),
+                              headers={'content-type':'text/event-stream'})
+    app, client = create(upstream)
+    with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
+        ws.send_json({'type':'response.create', 'model':'m', 'input':'parent', 'store':False, 'stream_id':'parent'})
+        assert ws.receive_json()['response']['id'] == 'resp_1'
+        source_id = store.lookup_binding('resp_1')
+        store.update(source_id, cooldown_kind='quota', cooldown_until=time.time()+3600)
+        ws.send_json({'type':'response.create', 'model':'m', 'input':'branch', 'previous_response_id':'resp_1',
+                      'store':False, 'stream_id':'fork'})
+        event = ws.receive_json()
+        assert event['response']['id'] == 'resp_2' and event['stream_id'] == 'fork'
+    assert calls[0][0] != calls[1][0]
+    assert calls[1][1]['input'] == [{'role':'user', 'content':'parent'}] + output + [{'role':'user', 'content':'branch'}]
+    assert 'previous_response_id' not in calls[1][1]
+    assert store.account(source_id)['cooldown_kind'] == 'quota'
+    assert all(n == 0 for n in app.state.pool.inflight.values())
+
+
+@pytest.mark.parametrize('raw', ['{"type":"response.create","model":"m","input":NaN}',
+                                '{"type":"response.create","model":"m","input":"\\ud800"}',
+                                '{"type":"response.create","model":"m","input":' + '['*10000 + '0' + ']'*10000 + '}'], ids=['nan', 'surrogate', 'deep'])
+def test_invalid_json_does_not_break_socket_or_reserve_account(setup, raw):
+    store, create = setup
+    store.add_account('agent', 'key', models=['m'])
+    calls = []
+    def upstream(request):
+        calls.append(request)
+        return httpx.Response(200, stream=EventStream([completed()]), headers={'content-type':'text/event-stream'})
+    app, client = create(upstream)
+    with client.websocket_connect('/v1/responses', headers=dict(AUTH)) as ws:
+        ws.send_text(raw)
+        assert ws.receive_json()['error']['code'] == 'Gateway.invalid_json'
+        ws.send_json({'type':'response.create', 'model':'m', 'input':'test'})
+        assert ws.receive_json()['type'] == 'response.completed'
+    assert len(calls) == 1 and all(n == 0 for n in app.state.pool.inflight.values())
