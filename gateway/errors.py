@@ -31,7 +31,7 @@ RATE_ERRORS = {"TooManyRequests", "AccountRateLimitExceeded", "APIAccountRpmRate
                "RateLimitExceeded.EndpointFlexTPMExceeded"}
 KNOWN_CODES = MODEL_ERRORS | ACCOUNT_ERRORS | OVERLOAD_ERRORS | RATE_ERRORS | {
     "AuthenticationError", "InvalidApiKey", "InvalidAPIKey", "MissingHeader",
-    "QuotaExceeded", "QuotaExceeded.AgentPlanQuotaExceeded", "SetLimitExceeded", "SessionQuotaExceeded",
+    "QuotaExceeded", "AccountQuotaExceeded", "QuotaExceeded.AgentPlanQuotaExceeded", "SetLimitExceeded", "SessionQuotaExceeded",
     "MissingParameter", "InvalidParameter", "AccessDenied", "OperationDenied.InvalidState",
     "OperationDenied.UnsupportedPhase", "OperationDenied.FileQuotaExceeded", "OperationDenied.ArkAccessRoleNotFound",
     "OperationDenied.TosAccessDenied", "QuotaExceeded.DoubaoSearchFreeQuotaExceeded",
@@ -90,7 +90,7 @@ def reset_from_error(data: dict, now: float) -> float | None:
     error = data.get("error") if isinstance(data.get("error"), dict) else {}
     raw = data.get("reset_time") or data.get("resetTime") or error.get("reset_time") or error.get("resetTime")
     if raw is None:
-        match = re.search(r"(?:reset(?:s| at)?|恢复(?:于|时间)?)[^\d]{0,12}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})?|\d{10,13})",
+        match = re.search(r"(?:reset(?:s| at)?|恢复(?:于|时间)?)[^\d]{0,12}(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\s*(?:Z|[+-]\d{2}:?\d{2}))?|\d{10,13})",
                           str(error.get("message", "")), re.I)
         raw = match.group(1) if match else None
     try:
@@ -130,7 +130,7 @@ def classify_error(status: int, body: bytes, headers: dict, now: float) -> tuple
         return "auth", None
     if code == "SetLimitExceeded" or (code == "QuotaExceeded" and re.search(r"free trial|免费试用", message, re.I)):
         return "model_limit", None
-    if code.startswith("QuotaExceeded.AgentPlan") or (code == "QuotaExceeded" and re.search(
+    if code == "AccountQuotaExceeded" or code.startswith("QuotaExceeded.AgentPlan") or (code == "QuotaExceeded" and re.search(
             r"(?:5.hour|daily|per.day|weekly|monthly|usage quota|每日|每天|日配额|额度.*(?:耗尽|超出))", message, re.I)):
         resets = [value for value in (reset_from_error(data, now), retry_after(headers, now)) if value is not None]
         return "quota", max(resets) if resets else None

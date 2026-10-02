@@ -375,7 +375,8 @@ async def test_chat_disconnect_closes_upstream_and_releases_account(setup):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('stream', [False, True])
-async def test_daily_quota_stream_error_cools_account_without_replay(setup, stream):
+@pytest.mark.parametrize('code', ['QuotaExceeded', 'AccountQuotaExceeded'])
+async def test_daily_quota_stream_error_cools_account_without_replay(setup, stream, code):
     store, create_app = setup
     store.add_account('agent', 'a', models=['m'])
     store.add_account('coding', 'b', models=['m'])
@@ -384,7 +385,7 @@ async def test_daily_quota_stream_error_cools_account_without_replay(setup, stre
     def upstream(request):
         calls.append(request)
         return httpx.Response(200, stream=BytesStream(sse(
-            {'type': 'error', 'error': {'code': 'QuotaExceeded', 'message': 'daily quota exhausted', 'reset_time': reset}})),
+            {'type': 'error', 'error': {'code': code, 'message': 'daily quota exhausted', 'reset_time': reset}})),
             headers={'content-type': 'text/event-stream'})
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
         app = create_app(store, remote)
@@ -394,6 +395,7 @@ async def test_daily_quota_stream_error_cools_account_without_replay(setup, stre
     assert len(calls) == 1
     cooling = [a for a in store.accounts() if a['cooldown_kind'] == 'quota']
     assert len(cooling) == 1 and cooling[0]['cooldown_until'] == reset
+    assert cooling[0]['cooldown_code'] == code
     assert len(await app.state.pool.candidates('m')) == 1
 
 

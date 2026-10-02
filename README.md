@@ -78,7 +78,7 @@ if response.status_code == 429:
 
 错误约定以字节火山方舟 [Agent / Coding Plan 推理错误码](https://docs.volcengine.com/docs/ark/error-codes?lang=zh)为准。上游 `error.type`、完整 `error.code`（包含点号后缀）、`message`、`param`、请求 ID 和其他原有字段均保持不变，未知错误也不替换成通用错误。保留错误原有 HTTP 状态码，例如 Coding Plan 的 `400 / Forbidden / InvalidSubscription` 不改成 403。
 
-Coding Plan 的 `QuotaExceeded` 与 Agent Plan 的 `QuotaExceeded.AgentPlanQuotaExceeded` 按原样返回；账号切换最终失败时返回最后一次上游错误。内部分类只影响账号调度和管理页，不增加下游字段。SSE 错误事件原样转发，上游已发出明确错误后不追加网关错误；成功响应与 SSE 也保留上游端到端响应头。
+套餐耗尽错误 `AccountQuotaExceeded`、Coding Plan 的 `QuotaExceeded` 与 Agent Plan 的 `QuotaExceeded.AgentPlanQuotaExceeded` 按原样返回，并暂停同一配额组，尝试其他可用组；账号切换最终失败时返回最后一次上游错误。重置时间以明确的上游时间或 `Retry-After` 为准，支持 `+0800 CST` 等带数字时区的格式；没有可信时间时保持配额暂停，等待额度刷新或手动恢复。内部分类只影响账号调度和管理页，不增加下游字段。SSE 错误事件原样转发，上游已发出明确错误后不追加网关错误；成功响应与 SSE 也保留上游端到端响应头。
 
 没有上游响应可供返回时，网关自身错误沿用方舟错误体结构与 `BadRequest`、`Unauthorized`、`Forbidden`、`TooManyRequests`、`InternalServerError` 等类型。自身错误码使用 `Gateway.` 前缀，例如 `Gateway.invalid_tool_arguments`、`Gateway.plan_pool_cooling_down`；这是网关的错误码，不冒充字节官方错误码，不伪造上游 Request ID。`/v1/` 的鉴权、404 和 405 错误也使用该结构；管理界面 `/api/` 的错误不属于推理协议。
 

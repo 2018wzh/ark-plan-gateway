@@ -35,6 +35,7 @@ def error(code, message="", **extra):
     (429, "QuotaExceeded", "Your account has exhausted its free trial quota.", "model_limit"),
     (429, "QuotaExceeded", "The request has exceeded the quota.", "rate"),
     (429, "QuotaExceeded", "You have exceeded the weekly usage quota.", "quota"),
+    (429, "AccountQuotaExceeded", "", "quota"),
     (429, "QuotaExceeded.AgentPlanQuotaExceeded", "", "quota"),
     (429, "FutureUnknownCode", "", "rate"), (429, "SessionQuotaExceeded", "", "request"),
     (500, "InternalServiceError", "", "server"), (503, "unknown", "", "server"),
@@ -64,6 +65,23 @@ def test_safe_error_metadata_and_untrusted_reset():
     for reset in (now - 1, float('nan'), 1e300, '2099-01-01T00:00:00'):
         assert classify_error(429, error('QuotaExceeded.AgentPlanQuotaExceeded', reset_time=reset), {}, now) == ('quota', None)
     assert classify_error(429, b'not-json', {}, now) == ('rate', None)
+
+
+@pytest.mark.parametrize('code', ['AccountQuotaExceeded', 'QuotaExceeded', 'QuotaExceeded.AgentPlanQuotaExceeded'])
+@pytest.mark.parametrize('window', ['5-hour', 'weekly', 'monthly'])
+def test_plan_quota_reset_with_spaced_numeric_timezone(code, window):
+    message = (f'You have exceeded the {window} usage quota. '
+               'It will reset at 2026-10-05 00:00:00 +0800 CST. '
+               'We recommend upgrading your plan for more quota, or waiting for the reset.')
+    assert classify_error(429, error(code, message), {}, 1_790_000_000) == ('quota', 1_791_129_600)
+    assert classify_error(429, error(code, message), {'retry-after': '2000000'}, 1_790_000_000) == ('quota', 1_792_000_000)
+    assert safe_error_code(error(code, message)) == code
+
+
+@pytest.mark.parametrize('message', ['', 'It will reset at 2099-01-01 00:00:00 CST.',
+                                      'It will reset at 2000-01-01 00:00:00 +0800 CST.'])
+def test_account_quota_without_trustworthy_reset(message):
+    assert classify_error(429, error('AccountQuotaExceeded', message), {}, time.time()) == ('quota', None)
 
 
 @pytest.fixture
@@ -272,9 +290,10 @@ async def test_refresh_preserves_future_quota_hold_and_partial_windows(store, mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('path', ['/v1/responses', '/v1/chat/completions'])
+@pytest.mark.parametrize('path', ['/v1/responses', '/v1/chat/completions', '/v1/responses/compact'])
+@pytest.mark.parametrize('code', ['QuotaExceeded', 'AccountQuotaExceeded'])
 @pytest.mark.parametrize('known', [True, False])
-async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, monkeypatch, path, known):
+async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, monkeypatch, path, code, known):
     monkeypatch.setenv('ARK_GATEWAY_ALLOW_UNCONFIGURED', '1')
     monkeypatch.setenv('ARK_GATEWAY_ADMIN_PASSWORD', 'test-password-123')
     monkeypatch.setenv('ARK_GATEWAY_SERVICE_TOKEN', 'service-token-123456789012345')
@@ -284,7 +303,7 @@ async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, mo
     calls = []
     def upstream(request):
         calls.append(request)
-        return httpx.Response(429, content=error('QuotaExceeded', 'daily quota exhausted'),
+        return httpx.Response(429, content=error(code, 'daily quota exhausted', type='TooManyRequests', param=''),
                               headers={'retry-after': str(3600 if len(calls) == 1 else 7200)} if known else {})
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
         app = create_app(store, remote)
@@ -293,7 +312,9 @@ async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, mo
                 response = await client.post(path, headers={'authorization': 'Bearer service-token-123456789012345'},
                                              json={'model': 'm', 'input': 'test', 'messages': [{'role': 'user', 'content': 'test'}]})
                 assert response.status_code == 429
-                assert response.json()['error']['code'] == ('QuotaExceeded' if turn == 0 else 'Gateway.plan_pool_cooling_down' if known else 'Gateway.plan_quota_exhausted')
+                assert response.json()['error']['code'] == (code if turn == 0 else 'Gateway.plan_pool_cooling_down' if known else 'Gateway.plan_quota_exhausted')
+                if turn == 0:
+                    assert response.content == error(code, 'daily quota exhausted', type='TooManyRequests', param='')
                 assert 'metadata' not in response.json()['error']
                 if known and turn == 0:
                     assert int(response.headers['retry-after']) == 7200
@@ -303,6 +324,45 @@ async def test_daily_exhaustion_enters_cooldown_and_stops_repeat_calls(store, mo
                     assert 'retry-after' not in response.headers
     assert len(calls) == 2
     assert all(a['cooldown_kind'] == 'quota' for a in store.accounts())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('known', [True, False])
+async def test_account_quota_skips_shared_group_and_fails_over(store, monkeypatch, known):
+    monkeypatch.setenv('ARK_GATEWAY_ADMIN_PASSWORD', 'test-password-123')
+    monkeypatch.setenv('ARK_GATEWAY_SERVICE_TOKEN', 'service-token-123456789012345')
+    from gateway.main import create_app
+    first = store.add_account('coding', 'first', models=['m', 'other'])
+    sibling = store.add_account('coding', 'sibling', models=['m', 'other'])
+    healthy = store.add_account('agent', 'healthy', models=['m', 'other'])
+    store.set_quota_group(sibling, first)
+    for aid in (first, sibling, healthy):
+        store.update(aid, usage_json=json.dumps({'weekly': {'quota': 100, 'used': 90 if aid == healthy else 0}}))
+    reset = time.time() + 3600
+    calls = []
+
+    def upstream(request):
+        key = request.headers['authorization'].split()[-1]
+        calls.append(key)
+        if key != 'healthy':
+            return httpx.Response(429, content=error('AccountQuotaExceeded', type='TooManyRequests', param='',
+                                                   **({'reset_time': reset} if known else {})))
+        return httpx.Response(200, json={'id': 'resp_ok', 'model': 'm', 'output': []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        app = create_app(store, remote)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            for _ in range(2):
+                r = await client.post('/v1/responses', headers={'authorization': 'Bearer service-token-123456789012345'},
+                                      json={'model': 'm', 'input': 'test'})
+                assert r.status_code == 200
+    assert len(calls) == 3 and calls[0] in ('first', 'sibling') and calls[1:] == ['healthy', 'healthy']
+    for aid in (first, sibling):
+        account = store.account(aid)
+        assert account['cooldown_kind'] == 'quota' and account['cooldown_code'] == 'AccountQuotaExceeded'
+        assert account['cooldown_until'] == (reset if known else None)
+        assert account['auth_failed'] == 0 and account['expired'] == 0
+    assert [a['id'] for a in await app.state.pool.candidates('other')] == [healthy]
 
 
 @pytest.mark.asyncio
