@@ -12,9 +12,11 @@ import SettingsPanel from './SettingsPanel';
 import './style.css';
 
 const Statistics=lazy(()=>import('./Statistics'));
+const AuditLog=lazy(()=>import('./AuditLog'));
 const pages=[
   {key:'accounts',label:'账号与额度',description:'管理套餐密钥、可用额度与账号状态',icon:<TeamOutlined/>},
   {key:'statistics',label:'消耗统计',description:'按模型查看 Token 消耗与等效价格',icon:<BarChartOutlined/>},
+  {key:'audit',label:'请求审计',description:'查询错误历史、上游请求 ID 与账号切换结果',icon:<SafetyCertificateOutlined/>},
   {key:'pricing',label:'模型定价',description:'配置默认单价与各模型的专属价格',icon:<DollarOutlined/>},
   {key:'routes',label:'路由状态',description:'查看模型映射、账号状态与当前并发',icon:<ApiOutlined/>},
   {key:'settings',label:'服务设置',description:'管理额度刷新与访问凭据',icon:<SettingOutlined/>},
@@ -64,6 +66,7 @@ function App(){
       {loadError&&<Alert className="inline-alert" type="warning" showIcon message="自动更新暂不可用，当前显示上次数据" description={loadError} action={<Button size="small" onClick={load}>重试</Button>}/>}
       {tab==='accounts'&&<AccountsPanel accounts={accounts} onEdit={setEditor} reload={load} updatedAt={updatedAt}/>}
       {tab==='statistics'&&<Suspense fallback={<Card loading/>}><Statistics accounts={accounts} api={api}/></Suspense>}
+      {tab==='audit'&&<Suspense fallback={<Card loading/>}><AuditLog accounts={accounts}/></Suspense>}
       {tab==='pricing'&&<Pricing models={[...new Set(accounts.flatMap(a=>a.models))]} onDirty={setDirty}/>}
       {tab==='settings'&&<SettingsPanel onDirty={setDirty} onPasswordChanged={()=>{generation.current++;setDirty(false);setLogged(false)}}/>}
       {tab==='routes'&&<Card title="模型与账号"><Table<Account> rowKey="id" dataSource={accounts} pagination={false} scroll={{x:900}} columns={[

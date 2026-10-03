@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 import httpx
 import anyio
-from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -27,6 +27,7 @@ from .errors import gateway_error, safe_error_code
 from .store import Store
 from .limits import Admission, BodyTooLarge, LoginThrottle, SecurityBoundary, bounded_response, decoded_chunks
 from .websocket import serve_responses
+from .audit import AuditMiddleware, audited_request, current_audit, local_error
 
 AGENT_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 CODING_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
@@ -47,6 +48,7 @@ def password_ok(password: str, hashed: str) -> bool:
 
 def error_response(status: int, code: str, retry_at: float | None = None,
                    param: str | None = None) -> JSONResponse:
+    local_error(code, param)
     headers = {}
     message = None
     if retry_at is not None:
@@ -257,6 +259,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
 
     app.add_middleware(SecurityBoundary, admin=require_admin, service=require_service,
         requests=app.state.requests, login_throttle=LoginThrottle(), error_response=error_response)
+    app.add_middleware(AuditMiddleware, store=store)
 
     async def hash_password(function, *args):
         if not hashing.acquire():
@@ -391,6 +394,16 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         require_admin(request)
         return store.pricing()
 
+    @app.get("/api/audit")
+    async def audit_history(request: Request, days: int = Query(7, ge=1, le=30),
+            limit: int = Query(50, ge=1, le=200), before: int | None = Query(None, ge=1),
+            errors_only: bool = True, source: str | None = Query(None, pattern="^(upstream|gateway|client)$"),
+            error_code: str | None = Query(None, max_length=128), model: str | None = Query(None, max_length=128),
+            http_status: int | None = Query(None, ge=100, le=599), request_id: str | None = Query(None, max_length=128)):
+        require_admin(request)
+        return await anyio.to_thread.run_sync(lambda: store.audit_history(days, limit, before, errors_only,
+            source, error_code, model, http_status, request_id))
+
     @app.put("/api/pricing")
     async def edit_pricing(body: PricingIn, request: Request):
         require_admin(request, True)
@@ -440,7 +453,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 continue
             started = time.monotonic()
             started_at = time.time()
+            audit = current_audit.get()
+            if audit is not None:
+                audit.start_attempt(account, model)
             def record(outcome: str, response_data: object = None):
+                if audit is not None:
+                    audit.result(outcome)
                 if method == "POST":
                     inputs, outputs = token_usage(response_data, chat)
                     usage = response_data.get("usage") if isinstance(response_data, dict) else None
@@ -449,7 +467,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     reported_model = response_data.get("model") if isinstance(response_data, dict) else None
                     usage_model = reported_model if isinstance(reported_model, str) and 0 < len(reported_model) <= 128 else account["model_mapping"].get(model, model)
                     store.record_request(account["id"], outcome, int((time.monotonic() - started) * 1000), usage_model, inputs, outputs, started_at, context)
-                if outcome == "success":
+                if outcome == "success" and method == "POST":
                     pool.update_result(account, "ok", None, model)
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
@@ -473,7 +491,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     account_body = json.dumps(account_json, ensure_ascii=False).encode()
                 req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
-            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if audit is not None:
+                    audit.upstream(upstream)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                if audit is not None:
+                    audit.error("gateway", "Gateway.upstream_connection_failed", type(exc).__name__)
                 record("connection_error")
                 if method == "POST":
                     pool.update_result(account, "server", None, model)
@@ -483,12 +505,16 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     transient_failures += 1
                     continue
                 return error_response(502, "upstream_connection_failed")
-            except httpx.PoolTimeout:
+            except httpx.PoolTimeout as exc:
+                if audit is not None:
+                    audit.error("gateway", "Gateway.gateway_connection_pool_busy", type(exc).__name__)
                 record("connection_pool_busy")
                 with anyio.CancelScope(shield=True):
                     await pool.release(account)
                 return error_response(503, "gateway_connection_pool_busy")
-            except (httpx.TimeoutException, httpx.TransportError):
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                if audit is not None:
+                    audit.error("gateway", "Gateway.upstream_transport_ambiguous", type(exc).__name__)
                 record("transport_error")
                 if method == "POST":
                     pool.update_result(account, "server", None, model)
@@ -510,10 +536,13 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                 try:
                     raw = await bounded_response(upstream)
                 except BodyTooLarge:
+                    local_error("upstream_response_too_large")
                     record("response_error")
                     await close_upstream()
                     return error_response(502, "upstream_response_too_large")
-                except (httpx.TimeoutException, httpx.TransportError, ValueError):
+                except (httpx.TimeoutException, httpx.TransportError, ValueError) as exc:
+                    if audit is not None:
+                        audit.error("gateway", "Gateway.upstream_response_failed", type(exc).__name__)
                     record("response_error")
                     if method == "POST":
                         pool.update_result(account, "server", None, model)
@@ -525,6 +554,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     raise
                 kind, until = classify_error(upstream.status_code, raw, upstream.headers, time.time())
                 code = safe_error_code(raw)
+                if audit is not None:
+                    audit.upstream_error(raw)
                 last_response = forward_response_headers(Response(content=raw, status_code=upstream.status_code), upstream)
                 record(kind)
                 # A lookup/deletion error must not quarantine a working model.
@@ -542,15 +573,19 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             if not upstream_sse:
                 try:
                     if stream:
+                        local_error("upstream_stream_expected")
                         record("response_error")
                         if method == "POST":
                             pool.update_result(account, "server", None, model)
                         return error_response(502, "upstream_stream_expected")
                     raw = await bounded_response(upstream)
                     if method != "POST":
+                        record("success")
                         return forward_response_headers(Response(content=raw, status_code=upstream.status_code), upstream)
                     data = json.loads(raw)
                     if isinstance(data, dict) and (data.get("error") or data.get("status") == "failed"):
+                        if audit is not None:
+                            audit.upstream_error(raw)
                         kind, until = classify_error(500, raw, upstream.headers, time.time())
                         pool.update_result(account, kind, until, model, safe_error_code(raw))
                         record(kind, data)
@@ -561,9 +596,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     return forward_response_headers(Response(content=raw, status_code=upstream.status_code,
                                     media_type=upstream.headers.get("content-type", "application/json")), upstream)
                 except BodyTooLarge:
+                    local_error("upstream_response_too_large")
                     record("response_error")
                     return error_response(502, "upstream_response_too_large")
-                except (httpx.TimeoutException, httpx.TransportError, ValueError, RecursionError):
+                except (httpx.TimeoutException, httpx.TransportError, ValueError, RecursionError) as exc:
+                    if audit is not None:
+                        audit.error("gateway", "Gateway.upstream_response_failed", type(exc).__name__)
                     record("response_error")
                     if method == "POST":
                         pool.update_result(account, "server", None, model)
@@ -603,6 +641,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         if not error and obj.get("type") == "error":
                             error = {k: v for k, v in obj.items() if k not in ("type", "sequence_number", "stream_id")}
                         raw_error = json.dumps({"error": error}).encode()
+                        if audit is not None:
+                            audit.upstream_error(raw_error)
                         status = obj.get("status", 500)
                         status = status if isinstance(status, int) and not isinstance(status, bool) and 400 <= status <= 599 else 500
                         kind, until = classify_error(status, raw_error, upstream.headers, time.time())
@@ -642,6 +682,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         await close_upstream()
 
             def failure_event(code):
+                local_error(code)
                 if chat:
                     event = gateway_error(502, code)
                 else:
@@ -713,6 +754,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             data = request_json(raw)
         except ProtocolError:
             return error_response(400, "invalid_json")
+        if current_audit.get() is not None and isinstance(data, dict):
+            current_audit.get().model(data.get("model"))
         validated = validate_generation(data, chat, compact)
         if isinstance(validated, Response):
             return validated
@@ -733,6 +776,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         try:
             require_service(websocket)
         except HTTPException:
+            async with audited_request(store, "GET", "/v1/responses", "websocket"):
+                local_error("invalid_token")
             await websocket.close(code=1008)
             return
 
@@ -754,6 +799,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                                allow_unpin=bool(binding_id and not data.get("previous_response_id")))
 
         if not app.state.sockets.acquire():
+            async with audited_request(store, "GET", "/v1/responses", "websocket"):
+                local_error("websocket_connection_limit_reached")
             await websocket.close(code=1013)
             return
         try:

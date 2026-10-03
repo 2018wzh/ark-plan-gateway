@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .protocols import ProtocolError, SSEDecoder, request_json
 from .errors import gateway_error
+from .audit import audited_request, current_audit
 
 MAX_MESSAGE_BYTES = 8_000_000
 MAX_QUEUE_ITEMS = 256
@@ -107,11 +108,15 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
             await websocket.send_json(event)
 
     async def error(code, stream_id=None, status=400):
+        if current_audit.get() is None:
+            async with audited_request(resources.store, "POST", "/v1/responses", "websocket"):
+                return await error(code, stream_id, status)
         payload = gateway_error(status, code)
         payload["error"]["param"] = None
         if code in ("invalid_stream_id", "previous_response_not_found", "websocket_stream_limit_reached"):
             payload["error"].update(code=code, type="invalid_request_error",
                                     param="previous_response_id" if code == "previous_response_not_found" else "stream_id")
+        current_audit.get().error("gateway", payload["error"]["code"], payload["error"]["type"], payload["error"].get("param"))
         await send({"type": "error", "status": status, **payload}, stream_id)
 
     async def send_rejection(result, stream_id):
@@ -128,6 +133,13 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
             if payload["error"].get("code") == "Gateway.previous_response_unknown":
                 await error("previous_response_not_found", stream_id)
                 return
+        audit = current_audit.get()
+        if audit is not None and not audit.data["source"]:
+            error_data = payload.get("error", {})
+            if not isinstance(error_data, dict):
+                error_data = {}
+            audit.error("gateway" if isinstance(result, JSONResponse) else "upstream",
+                error_data.get("code") or "UnknownUpstreamError", error_data.get("type"), error_data.get("param"))
         await send({**payload, "type": "error", "status": result.status_code}, stream_id)
 
     async def process(event, stream_id):
@@ -136,6 +148,7 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
                 raise ProtocolError("generate_must_be_boolean")
             warmup = event.get("generate") is False
             body = {k: v for k, v in event.items() if k not in ("type", "generate", "stream_id")}
+            current_audit.get().model(body.get("model"))
             body["stream"] = True
             history = next((h for h in histories.values() if h.response_id == body.get("previous_response_id")), SocketHistory())
             body, binding_id = history.prepare(body, stream_id)
@@ -191,20 +204,21 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
                 try:
                     while True:
                         raw, size = await queue.get()
-                        async with capacity:
-                            try:
-                                if not resources.requests.acquire():
-                                    await error("gateway_busy", stream_id, 503)
-                                    continue
-                                try:
-                                    await process(request_json(raw), stream_id)
-                                finally:
-                                    resources.requests.release()
-                            finally:
-                                queued_bytes -= size
-                                resources.socket_queue_bytes -= size
-                                queued_items -= 1
-                                raw = None
+                        try:
+                            async with audited_request(resources.store, "POST", "/v1/responses", "websocket"):
+                                async with capacity:
+                                    if not resources.requests.acquire():
+                                        await error("gateway_busy", stream_id, 503)
+                                        continue
+                                    try:
+                                        await process(request_json(raw), stream_id)
+                                    finally:
+                                        resources.requests.release()
+                        finally:
+                            queued_bytes -= size
+                            resources.socket_queue_bytes -= size
+                            queued_items -= 1
+                            raw = None
                 except (WebSocketDisconnect, OSError):
                     group.cancel_scope.cancel()
 
@@ -256,3 +270,11 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
     finally:
         resources.socket_queue_bytes -= queued_bytes
         resources.socket_history_bytes -= sum(h.size for h in histories.values())
+        # Accepted frames that never reached a worker still have a disconnect history.
+        with anyio.CancelScope(shield=True):
+            for queue in lanes.values():
+                while not queue.empty():
+                    queue.get_nowait()
+                    async with audited_request(resources.store, "POST", "/v1/responses", "websocket") as audit:
+                        audit.error("client", "client_disconnected_before_dispatch")
+                        audit.data["outcome"] = "disconnected"

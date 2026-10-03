@@ -20,6 +20,8 @@ from .private_files import create_private, private_directory, restrict
 
 MAX_BINDINGS = 100_000
 BINDING_TTL = 30 * 86400
+MAX_AUDIT_ROWS = 10_000
+AUDIT_TTL = 30 * 86400
 
 
 class Store:
@@ -72,6 +74,18 @@ class Store:
           output_tokens INTEGER NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0,
           PRIMARY KEY (day, account_id, outcome)
         );
+        CREATE TABLE IF NOT EXISTS request_audit (
+          id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+          request_id TEXT NOT NULL, transport TEXT NOT NULL, method TEXT NOT NULL,
+          path TEXT NOT NULL, model TEXT NOT NULL, http_status INTEGER,
+          outcome TEXT NOT NULL, source TEXT NOT NULL, error_code TEXT NOT NULL,
+          error_type TEXT NOT NULL, error_param TEXT NOT NULL, account_id TEXT NOT NULL,
+          plan TEXT NOT NULL, upstream_status INTEGER, upstream_request_id TEXT NOT NULL,
+          duration_ms INTEGER NOT NULL, attempt_count INTEGER NOT NULL,
+          had_errors INTEGER NOT NULL, attempts_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS request_audit_age ON request_audit(created_at);
+        CREATE INDEX IF NOT EXISTS request_audit_request ON request_audit(request_id);
         """)
         if "model_mapping" not in {r[1] for r in self.db.execute("PRAGMA table_info(accounts)")}:
             self.db.execute("ALTER TABLE accounts ADD COLUMN model_mapping TEXT NOT NULL DEFAULT '{}'")
@@ -108,7 +122,66 @@ class Store:
         self.db.execute("DELETE FROM settings WHERE key='session_secret'")
         self._binding_count = self.db.execute("SELECT COUNT(*) FROM response_bindings").fetchone()[0]
         self._prune_bindings_locked(time.time())
+        self.audit_write_failures = 0
+        self.audit_capacity = threading.BoundedSemaphore(32)
+        self.audit_metrics_lock = threading.Lock()
+        self.audit_warning_at = float('-inf')
+        self._audit_pruned_at = 0
+        self._audit_count = self.db.execute("SELECT COUNT(*) FROM request_audit").fetchone()[0]
+        self._prune_audit_locked(time.time())
         self.db.commit()
+
+    def _prune_audit_locked(self, now):
+        if now - self._audit_pruned_at >= 60:
+            self._audit_count -= self.db.execute("DELETE FROM request_audit WHERE created_at < ?", (now - AUDIT_TTL,)).rowcount
+            self._audit_pruned_at = now
+        if self._audit_count > MAX_AUDIT_ROWS:
+            self._audit_count -= self.db.execute("DELETE FROM request_audit WHERE id IN "
+                "(SELECT id FROM request_audit ORDER BY id LIMIT ?)", (self._audit_count - MAX_AUDIT_ROWS,)).rowcount
+
+    def record_audit(self, data: dict):
+        fields = ("created_at", "request_id", "transport", "method", "path", "model", "http_status",
+            "outcome", "source", "error_code", "error_type", "error_param", "account_id", "plan",
+            "upstream_status", "upstream_request_id", "duration_ms", "attempt_count")
+        had_errors = data["outcome"] != "success" or any(a["outcome"] != "success" for a in data["attempts"])
+        with self.lock, self.db:
+            self.db.execute("INSERT INTO request_audit (" + ",".join(fields) + ",had_errors,attempts_json) VALUES (" +
+                ",".join("?" for _ in range(len(fields) + 2)) + ")",
+                (*[data[k] for k in fields], int(had_errors), json.dumps(data["attempts"], separators=(",", ":"))))
+            self._audit_count += 1
+            self._prune_audit_locked(time.time())
+
+    def audit_history(self, days=7, limit=50, before=None, errors_only=True, source=None,
+                      error_code=None, model=None, http_status=None, request_id=None):
+        conditions, args = ["created_at>=?"], [time.time() - min(days * 86400, AUDIT_TTL)]
+        if errors_only:
+            conditions.append("had_errors=1")
+        for key, value in (("source", source), ("error_code", error_code)):
+            if value:
+                conditions.append(f"({key}=? OR EXISTS(SELECT 1 FROM json_each(attempts_json) "
+                    f"WHERE json_extract(value,'$.{key}')=?))")
+                args.extend((value, value))
+        for key, value in (("model", model), ("http_status", http_status), ("request_id", request_id)):
+            if value is not None:
+                conditions.append(f"{key}=?")
+                args.append(value)
+        where = " AND ".join(conditions)
+        with self.lock, self.db:
+            self._prune_audit_locked(time.time())
+            total = self.db.execute("SELECT COUNT(*) FROM request_audit WHERE " + where, args).fetchone()[0]
+            summary = [dict(r) for r in self.db.execute("SELECT source,error_code,COUNT(*) AS count,MAX(created_at) AS last_seen "
+                "FROM request_audit WHERE " + where + " AND outcome='error' GROUP BY source,error_code ORDER BY count DESC LIMIT 20", args)]
+            recovered = self.db.execute("SELECT COUNT(*) FROM request_audit WHERE " + where + " AND outcome='success' AND had_errors=1", args).fetchone()[0]
+            page_where = where + (" AND id<?" if before is not None else "")
+            page_args = [*args, *([before] if before is not None else []), min(200, max(1, limit)) + 1]
+            rows = [dict(r) for r in self.db.execute("SELECT * FROM request_audit WHERE " + page_where + " ORDER BY id DESC LIMIT ?", page_args)]
+            more = len(rows) > limit
+            rows = rows[:limit]
+            for row in rows:
+                row["attempts"] = json.loads(row.pop("attempts_json"))
+            return dict(items=rows, next_cursor=rows[-1]["id"] if more and rows else None, total=total,
+                summary=summary, recovered=recovered, retention_days=30, max_rows=MAX_AUDIT_ROWS,
+                write_failures=self.audit_write_failures)
 
     def _prune_bindings_locked(self, now: float) -> None:
         deleted = self.db.execute("DELETE FROM response_bindings WHERE created_at < ?", (now - BINDING_TTL,)).rowcount
