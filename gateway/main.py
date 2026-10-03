@@ -25,6 +25,7 @@ from .pool import AccountPool, classify_error
 from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments, request_json
 from .errors import gateway_error, safe_error_code
 from .store import Store
+from .limits import Admission, BodyTooLarge, LoginThrottle, SecurityBoundary, bounded_response, decoded_chunks
 from .websocket import serve_responses
 
 AGENT_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
@@ -102,13 +103,13 @@ class AccountPatch(BaseModel):
 
 
 class LoginIn(BaseModel):
-    password: str
+    password: str = Field(max_length=1024)
 
 
 class SettingsIn(BaseModel):
     refresh_seconds: int | None = Field(default=None, ge=30, le=3600)
-    new_password: str | None = Field(default=None, min_length=12)
-    new_service_token: str | None = Field(default=None, min_length=24)
+    new_password: str | None = Field(default=None, min_length=12, max_length=1024)
+    new_service_token: str | None = Field(default=None, min_length=24, max_length=4096)
 
 
 class Price(BaseModel):
@@ -166,8 +167,6 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         if len(token) < 24:
             raise RuntimeError("ARK_GATEWAY_SERVICE_TOKEN (24+ chars) is required on first start")
         store.set_setting("service_token", store._enc(token))
-    if not store.setting("session_secret"):
-        store.set_setting("session_secret", secrets.token_hex(32))
     if not store.setting("refresh_seconds"):
         store.set_setting("refresh_seconds", "60")
 
@@ -212,6 +211,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     app.state.store = store
     app.state.pool = pool
     app.state.client = client
+    app.state.requests = Admission(32)
+    app.state.sockets = Admission(16)
+    app.state.socket_queue_bytes = 0
+    app.state.socket_history_bytes = 0
+    hashing = Admission(2)
+    hash_threads = anyio.CapacityLimiter(2)
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(request: Request, exc: StarletteHTTPException):
@@ -229,9 +234,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             raise HTTPException(401, "invalid token")
 
     def session_value() -> str:
-        secret = store.setting("session_secret")
         stamp = str(int(time.time()))
-        sig = hmac.new(secret.encode(), (stamp + store.setting("admin_hash")).encode(), hashlib.sha256).hexdigest()
+        sig = hmac.new(store.session_key, (stamp + store.setting("admin_hash")).encode(), hashlib.sha256).hexdigest()
         return stamp + "." + sig
 
     def require_admin(request: Request, write: bool = False):
@@ -240,8 +244,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             stamp, sig = cookie.split(".", 1)
             if time.time() - int(stamp) > 86400 or time.time() < int(stamp):
                 raise ValueError()
-            secret = store.setting("session_secret")
-            expected = hmac.new(secret.encode(), (stamp + store.setting("admin_hash")).encode(), hashlib.sha256).hexdigest()
+            expected = hmac.new(store.session_key, (stamp + store.setting("admin_hash")).encode(), hashlib.sha256).hexdigest()
             if not hmac.compare_digest(sig, expected):
                 raise ValueError()
         except (ValueError, TypeError):
@@ -252,9 +255,23 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             if origin and origin not in (f"http://{host}", f"https://{host}"):
                 raise HTTPException(403, "cross-origin write rejected")
 
+    app.add_middleware(SecurityBoundary, admin=require_admin, service=require_service,
+        requests=app.state.requests, login_throttle=LoginThrottle(), error_response=error_response)
+
+    async def hash_password(function, *args):
+        if not hashing.acquire():
+            raise HTTPException(429, "password verification busy", headers={"Retry-After": "1"})
+        async def calculate():
+            try:
+                return await anyio.to_thread.run_sync(function, *args, limiter=hash_threads)
+            finally:
+                hashing.release()
+        # A canceled HTTP task cannot abandon the verification and free its slot early.
+        return await asyncio.shield(asyncio.create_task(calculate()))
+
     @app.post("/api/login")
     async def login(body: LoginIn, response: Response, request: Request):
-        if not password_ok(body.password, store.setting("admin_hash")):
+        if not await hash_password(password_ok, body.password, store.setting("admin_hash")):
             raise HTTPException(401, "invalid password")
         response.set_cookie("ark_gateway_session", session_value(), httponly=True, samesite="strict",
                             secure=request.url.scheme == "https", max_age=86400)
@@ -344,7 +361,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         if body.refresh_seconds is not None:
             store.set_setting("refresh_seconds", str(body.refresh_seconds))
         if body.new_password:
-            store.set_setting("admin_hash", password_hash(body.new_password))
+            store.set_setting("admin_hash", await hash_password(password_hash, body.new_password))
         if body.new_service_token:
             store.set_setting("service_token", store._enc(body.new_service_token))
         return {"ok": True}
@@ -436,7 +453,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     pool.update_result(account, "ok", None, model)
             base = AGENT_URL if account["plan"] == "agent" else CODING_URL
             url = base + path
-            headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json"}
+            headers = {"Authorization": "Bearer " + account["api_key"], "Content-Type": "application/json",
+                       "Accept-Encoding": "gzip, deflate"}
             if generation:
                 headers["Accept"] = "text/event-stream"
             try:
@@ -490,8 +508,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         await pool.release(account)
             if upstream.status_code >= 300:
                 try:
-                    raw = await upstream.aread()
-                except (httpx.TimeoutException, httpx.TransportError):
+                    raw = await bounded_response(upstream)
+                except BodyTooLarge:
+                    record("response_error")
+                    await close_upstream()
+                    return error_response(502, "upstream_response_too_large")
+                except (httpx.TimeoutException, httpx.TransportError, ValueError):
                     record("response_error")
                     if method == "POST":
                         pool.update_result(account, "server", None, model)
@@ -524,7 +546,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                         if method == "POST":
                             pool.update_result(account, "server", None, model)
                         return error_response(502, "upstream_stream_expected")
-                    raw = await upstream.aread()
+                    raw = await bounded_response(upstream)
                     if method != "POST":
                         return forward_response_headers(Response(content=raw, status_code=upstream.status_code), upstream)
                     data = json.loads(raw)
@@ -538,6 +560,9 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     record("success", data)
                     return forward_response_headers(Response(content=raw, status_code=upstream.status_code,
                                     media_type=upstream.headers.get("content-type", "application/json")), upstream)
+                except BodyTooLarge:
+                    record("response_error")
+                    return error_response(502, "upstream_response_too_large")
                 except (httpx.TimeoutException, httpx.TransportError, ValueError, RecursionError):
                     record("response_error")
                     if method == "POST":
@@ -550,9 +575,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             state = StreamResult(chat, collect=not stream)
             stream_error: dict = {}
             last_sequence_number = -1
+            bound_created = False
+            bound_terminal = False
 
             def observe(chunk: bytes, final: bool = False):
-                nonlocal last_sequence_number
+                nonlocal last_sequence_number, bound_created, bound_terminal
                 for obj in decoder.finish() if final else decoder.feed(chunk):
                     state.observe(obj)
                     if obj is None:
@@ -563,8 +590,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     if isinstance(sequence, int) and not isinstance(sequence, bool):
                         last_sequence_number = max(last_sequence_number, sequence)
                     response_obj = obj.get("response", {})
+                    terminal = obj.get("type") in ("response.completed", "response.incomplete", "response.failed")
                     if not chat and isinstance(response_obj, dict) and response_obj.get("id"):
-                        store.bind(response_obj["id"], account["id"])
+                        if (not bound_created) or (terminal and not bound_terminal):
+                            store.bind(response_obj["id"], account["id"])
+                            bound_created = True
+                            bound_terminal |= terminal
                     if state.failed and not stream_error:
                         error = obj.get("error")
                         if not error and isinstance(response_obj, dict):
@@ -584,7 +615,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             if not stream:
                 outcome = "client_disconnected"
                 try:
-                    async for chunk in upstream.aiter_bytes():
+                    async for chunk in decoded_chunks(upstream):
                         if request is not None and await request.is_disconnected():
                             return error_response(499, "client_disconnected")
                         observe(chunk)
@@ -621,7 +652,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             async def events():
                 outcome = "client_disconnected"
                 try:
-                    async for chunk in upstream.aiter_bytes():
+                    async for chunk in decoded_chunks(upstream):
                         observe(chunk)
                         if state.done or state.failed:
                             outcome = "stream_error" if state.failed else "success"
@@ -677,9 +708,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
 
     async def create_generation(request: Request, chat: bool, compact: bool = False):
         require_service(request)
-        raw = await request.body()
-        if len(raw) > 8_000_000:
-            return error_response(413, "request_too_large")
+        raw = await request.body()  # SecurityBoundary already bounded the ASGI receive stream.
         try:
             data = request_json(raw)
         except ProtocolError:
@@ -724,7 +753,13 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return await proxy(None, "POST", "/responses", raw, model, pinned, True,
                                allow_unpin=bool(binding_id and not data.get("previous_response_id")))
 
-        await serve_responses(websocket, validate, generate)
+        if not app.state.sockets.acquire():
+            await websocket.close(code=1013)
+            return
+        try:
+            await serve_responses(websocket, validate, generate, app.state)
+        finally:
+            app.state.sockets.release()
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
@@ -740,7 +775,10 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         if not account:
             return error_response(404, "response_account_missing")
         model = account["models"][0]
-        return await proxy(request, request.method, "/responses/" + quote(response_id, safe=""), None, model, account_id)
+        result = await proxy(request, request.method, "/responses/" + quote(response_id, safe=""), None, model, account_id)
+        if request.method == "DELETE" and 200 <= result.status_code < 300:
+            store.unbind(response_id)
+        return result
 
     dist = Path(__file__).parent / "static"
     if dist.exists():

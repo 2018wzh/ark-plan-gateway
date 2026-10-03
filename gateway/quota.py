@@ -12,6 +12,7 @@ from volcengine.base.Request import Request
 
 from .pool import exhausted_windows
 from .store import Store
+from .limits import MAX_MANAGEMENT_BYTES, bounded_response
 
 AGENT_MANAGEMENT_HOST = "ark.cn-beijing.volcengineapi.com"
 CODING_MANAGEMENT_HOST = "open.volcengineapi.com"
@@ -66,7 +67,7 @@ async def management_call(action: str, ak: str, sk: str, body: dict) -> dict:
     query = {"Action": action, "Version": "2024-01-01", "Region": "cn-beijing"}
     text = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     host = CODING_MANAGEMENT_HOST if action == "GetCodingPlanUsage" else AGENT_MANAGEMENT_HOST
-    headers = {"Host": host, "Content-Type": "application/json"}
+    headers = {"Host": host, "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"}
     request = Request()
     request.host = headers["Host"]
     request.path = "/"
@@ -76,9 +77,9 @@ async def management_call(action: str, ak: str, sk: str, body: dict) -> dict:
     request.query = query
     SignerV4.sign(request, Credentials(ak, sk, "ark", "cn-beijing"))
     async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.post(f"https://{host}/", params=query, headers=headers, content=text.encode())
-        response.raise_for_status()
-        data = response.json()
+        async with client.stream("POST", f"https://{host}/", params=query, headers=headers, content=text.encode()) as response:
+            response.raise_for_status()
+            data = json.loads(await bounded_response(response, MAX_MANAGEMENT_BYTES))
         if data.get("ResponseMetadata", {}).get("Error"):
             raise RuntimeError("management API rejected request")
         return data.get("Result", {})

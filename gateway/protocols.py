@@ -2,6 +2,34 @@
 from __future__ import annotations
 
 import json
+import io
+import re
+
+MAX_EVENT_BYTES = 8_000_000
+LINE_ENDING = re.compile(b"[\r\n]")
+JSON_TOKEN = re.compile(rb'["\\{}\[\]]')
+MAX_JSON_DEPTH = 256
+
+
+def _check_json_depth(raw):
+    raw = raw.encode("utf-8") if isinstance(raw, str) else raw
+    position, depth, quoted = 0, 0, False
+    while match := JSON_TOKEN.search(raw, position):
+        token = raw[match.start()]
+        position = match.end()
+        if quoted:
+            if token == 92:
+                position += 1
+            elif token == 34:
+                quoted = False
+        elif token == 34:
+            quoted = True
+        elif token in (123, 91):
+            depth += 1
+            if depth > MAX_JSON_DEPTH:
+                raise ValueError("JSON nesting limit exceeded")
+        elif token in (125, 93):
+            depth -= 1
 
 
 class ProtocolError(ValueError):
@@ -12,6 +40,8 @@ def request_json(raw: bytes | str):
     def reject_constant(value):
         raise ValueError("non-finite JSON value")
     try:
+        raw = raw.decode("utf-8-sig") if not isinstance(raw, str) else raw
+        _check_json_depth(raw)
         value = json.loads(raw, parse_constant=reject_constant)
         # Reject escaped lone surrogates before reserving an upstream account.
         json.dumps(value, ensure_ascii=False).encode("utf-8")
@@ -29,6 +59,7 @@ def invalid_tool_arguments(data: dict, chat: bool) -> str | None:
         if not isinstance(value, str):
             return True
         try:
+            _check_json_depth(value)
             json.loads(value, parse_constant=reject_constant)
         except (ValueError, RecursionError):
             return True
@@ -59,35 +90,46 @@ class SSEDecoder:
     """Incremental SSE parser; forwarding still uses the original byte chunks."""
 
     def __init__(self):
-        self.buffer = b""
-        self.data: list[bytes] = []
+        self.buffer = bytearray()
+        self.data = bytearray()
         self.size = 0
         self.event_type: str | None = None
         self.started = False
+        self.scan = 0
+        self.has_data = False
 
     def feed(self, chunk: bytes):
-        self.buffer += chunk
+        self.buffer.extend(chunk)
         if not self.started:
             if len(self.buffer) < 3 and b"\xef\xbb\xbf".startswith(self.buffer):
                 return
-            self.buffer = self.buffer.removeprefix(b"\xef\xbb\xbf")
+            if self.buffer.startswith(b"\xef\xbb\xbf"):
+                del self.buffer[:3]
             self.started = True
+        start = 0
         while True:
-            endings = [i for i in (self.buffer.find(b"\r"), self.buffer.find(b"\n")) if i >= 0]
-            if not endings:
+            ending = LINE_ENDING.search(self.buffer, self.scan)
+            if ending is None:
+                self.scan = len(self.buffer)
                 break
-            end = min(endings)
-            line, separator, rest = self.buffer[:end], self.buffer[end:end+1], self.buffer[end+1:]
-            if separator == b"\r":
-                if not rest:
-                    break  # Wait to distinguish a split CRLF from a bare CR.
-                rest = rest.removeprefix(b"\n")
-            self.buffer = rest
+            end = ending.start()
+            if self.buffer[end] == 13 and end + 1 == len(self.buffer):
+                self.scan = end
+                break  # Preserve a split CRLF before exposing a terminal event.
+            line = self.buffer[start:end]
+            if self.size + len(line) > MAX_EVENT_BYTES:
+                raise ProtocolError("upstream_event_too_large")
+            start = end + 1
+            if self.buffer[end] == 13:
+                if self.buffer[start] == 10:
+                    start += 1
+            self.scan = start
             if not line:
-                if self.data:
-                    data = b"\n".join(self.data)
-                    self.data = []
+                if self.has_data:
+                    data = bytes(self.data[:-1])
+                    self.data.clear()
                     self.size = 0
+                    self.has_data = False
                     if data == b"[DONE]":
                         yield None
                     else:
@@ -113,11 +155,18 @@ class SSEDecoder:
                 value = line[5:]
                 if value.startswith(b" "):
                     value = value[1:]
-                self.data.append(value)
-                self.size += len(value)
-            if self.size > 8_000_000:
+                self.size += len(value) + 1  # Include even an empty data line's separator.
+                if self.size > MAX_EVENT_BYTES:
+                    raise ProtocolError("upstream_event_too_large")
+                self.data.extend(value)
+                self.data.append(10)
+                self.has_data = True
+            if self.size > MAX_EVENT_BYTES:
                 raise ProtocolError("upstream_event_too_large")
-        if self.size + len(self.buffer) > 8_000_000:
+        if start:
+            del self.buffer[:start]
+            self.scan -= start
+        if self.size + len(self.buffer) > MAX_EVENT_BYTES:
             raise ProtocolError("upstream_event_too_large")
 
     def finish(self):
@@ -162,8 +211,8 @@ class StreamResult:
         if event.get("usage"):
             self.usage_response["usage"] = event["usage"]
         if self.collect:
-            self.size += len(json.dumps(event, ensure_ascii=False))
-            if self.size > 8_000_000:
+            self.size += len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
+            if self.size > MAX_EVENT_BYTES:
                 raise ProtocolError("upstream_response_too_large")
             if self.response is None:
                 self.response = {}
@@ -203,11 +252,13 @@ class StreamResult:
                             if name == "function":
                                 function = tool.setdefault("function", {})
                                 for field, fragment in item.items():
-                                    function[field] = function.get(field, "") + fragment
+                                    function.setdefault(field, io.StringIO()).write(fragment)
                             else:
                                 tool[name] = item
                 elif key in ("content", "reasoning_content", "refusal") and isinstance(value, str):
-                    message[key] = (message.get(key) or "") + value
+                    if not isinstance(message.get(key), io.StringIO):
+                        message[key] = io.StringIO()
+                    message[key].write(value)
                 elif value is not None:
                     message[key] = value
 
@@ -217,7 +268,15 @@ class StreamResult:
         if self.chat:
             self.response["choices"] = [self.choices[i] for i in sorted(self.choices)]
             for choice in self.response["choices"]:
-                calls = choice["message"].get("tool_calls")
-                if calls is not None:
-                    choice["message"]["tool_calls"] = [calls[i] for i in sorted(calls)]
+                message = choice["message"]
+                for key, value in message.items():
+                    if isinstance(value, io.StringIO):
+                        message[key] = value.getvalue()
+                calls = message.get("tool_calls")
+                if isinstance(calls, dict):
+                    message["tool_calls"] = [calls[i] for i in sorted(calls)]
+                    for call in message["tool_calls"]:
+                        for field, value in call.get("function", {}).items():
+                            if isinstance(value, io.StringIO):
+                                call["function"][field] = value.getvalue()
         return self.response

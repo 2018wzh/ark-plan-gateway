@@ -8,6 +8,8 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 from dotenv import dotenv_values
 
+from .private_files import create_private
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -25,11 +27,8 @@ def main():
         "ARK_AGENT_PLAN_KEYS": source.get("ARK_AGENT_PLAN_KEYS", "") or "",
         "ARK_CODING_PLAN_KEYS": source.get("ARK_CODING_PLAN_KEYS", "") or "",
     }
-    args.output.write_text("".join(f'{k}="{v}"\n' for k, v in values.items()), encoding="utf-8")
-    try:
-        args.output.chmod(0o600)
-    except OSError:
-        pass
+    with create_private(args.output) as output:
+        output.write("".join(f'{k}="{v}"\n' for k, v in values.items()).encode("utf-8"))
     print(f"Created {args.output} with {len([x for x in values['ARK_AGENT_PLAN_KEYS'].split(';') if x.strip()])} Agent and {len([x for x in values['ARK_CODING_PLAN_KEYS'].split(';') if x.strip()])} Coding keys.")
 
 

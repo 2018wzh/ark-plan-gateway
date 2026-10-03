@@ -17,6 +17,8 @@ from .protocols import ProtocolError, SSEDecoder, request_json
 from .errors import gateway_error
 
 MAX_MESSAGE_BYTES = 8_000_000
+MAX_QUEUE_ITEMS = 256
+MAX_SHARED_BYTES = 64_000_000
 
 
 def input_items(value):
@@ -34,8 +36,7 @@ class SocketHistory:
 
     def __init__(self):
         self.response_id = None
-        self.body = {}
-        self.output = []
+        self.snapshot = b""
         self.binding_id = None
         self.stream_id = None
         self.warmup = False
@@ -44,10 +45,11 @@ class SocketHistory:
     def prepare(self, body, stream_id):
         binding_id = None
         if body.get("previous_response_id") == self.response_id and self.response_id:
-            merged = {**self.body, **body} if self.warmup else dict(body)
-            merged["input"] = input_items(self.body.get("input")) + self.output + input_items(body.get("input"))
+            cached_body, output = json.loads(self.snapshot)
+            merged = {**cached_body, **body} if self.warmup else dict(body)
+            merged["input"] = input_items(cached_body.get("input")) + output + input_items(body.get("input"))
             # The HTTP upstream has no access to this socket's local cache.
-            prior = self.body.get("previous_response_id")
+            prior = cached_body.get("previous_response_id")
             if prior:
                 merged["previous_response_id"] = prior
             else:
@@ -64,35 +66,39 @@ class SocketHistory:
         output = response.get("output", [])
         if not response.get("id") or not isinstance(output, list):
             return
-        size = len(json.dumps([body, output], ensure_ascii=False).encode())
+        snapshot = json.dumps([body, output], ensure_ascii=False).encode()
+        size = len(snapshot)
         if size > MAX_MESSAGE_BYTES:
             self.__init__()
             return
         self.response_id = response["id"]
-        self.body = body
-        self.output = output
+        self.snapshot = snapshot
         self.binding_id = binding_id if warmup else response["id"]
         self.stream_id = stream_id
         self.warmup = warmup
         self.size = size
 
 
-async def serve_responses(websocket: WebSocket, validate, generate):
+async def serve_responses(websocket: WebSocket, validate, generate, resources):
     await websocket.accept()
     send_lock = anyio.Lock()
     histories = OrderedDict()
     lanes = {}
     capacity = anyio.CapacityLimiter(16)
     queued_bytes = 0
+    queued_items = 0
 
     def remember(body, response, stream_id, **kwargs):
         history = SocketHistory()
         history.remember(body, response, stream_id, **kwargs)
-        histories.pop(stream_id, None)
-        if history.response_id:
+        previous = histories.pop(stream_id, None)
+        if previous:
+            resources.socket_history_bytes -= previous.size
+        if history.response_id and resources.socket_history_bytes + history.size <= MAX_SHARED_BYTES:
             histories[stream_id] = history
+            resources.socket_history_bytes += history.size
             while sum(h.size for h in histories.values()) > MAX_MESSAGE_BYTES:
-                histories.popitem(last=False)
+                resources.socket_history_bytes -= histories.popitem(last=False)[1].size
 
     async def send(event, stream_id=None):
         if stream_id is not None:
@@ -178,53 +184,75 @@ async def serve_responses(websocket: WebSocket, validate, generate):
         except ProtocolError:
             await error("upstream_stream_invalid", stream_id, 502)
 
-    async with anyio.create_task_group() as group:
-        async def worker(queue, stream_id):
-            nonlocal queued_bytes
+    try:
+        async with anyio.create_task_group() as group:
+            async def worker(queue, stream_id):
+                nonlocal queued_bytes, queued_items
+                try:
+                    while True:
+                        raw, size = await queue.get()
+                        async with capacity:
+                            try:
+                                if not resources.requests.acquire():
+                                    await error("gateway_busy", stream_id, 503)
+                                    continue
+                                try:
+                                    await process(request_json(raw), stream_id)
+                                finally:
+                                    resources.requests.release()
+                            finally:
+                                queued_bytes -= size
+                                resources.socket_queue_bytes -= size
+                                queued_items -= 1
+                                raw = None
+                except (WebSocketDisconnect, OSError):
+                    group.cancel_scope.cancel()
+
             try:
                 while True:
-                    event, size = await queue.get()
-                    async with capacity:
-                        queued_bytes -= size
-                        await process(event, stream_id)
-            except (WebSocketDisconnect, OSError):
-                group.cancel_scope.cancel()
-
-        try:
-            while True:
-                message = await websocket.receive()
-                if message["type"] == "websocket.disconnect":
-                    break
-                if message.get("text") is None:
-                    await error("text_frame_required")
-                    continue
-                stream_id = None
-                try:
-                    raw = message["text"]
-                    size = len(raw.encode())
-                    if size > MAX_MESSAGE_BYTES:
-                        raise ProtocolError("request_too_large")
-                    event = request_json(raw)
-                    if not isinstance(event, dict) or event.get("type") != "response.create":
-                        raise ProtocolError("unsupported_websocket_event")
-                    stream_id = event.get("stream_id")
-                    if "stream_id" in event and (not isinstance(stream_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", stream_id)):
-                        stream_id = None
-                        raise ProtocolError("invalid_stream_id")
-                    if stream_id not in lanes:
-                        if stream_id is not None and len([key for key in lanes if key is not None]) >= 32:
-                            raise ProtocolError("websocket_stream_limit_reached")
-                        lanes[stream_id] = asyncio.Queue()
-                        group.start_soon(worker, lanes[stream_id], stream_id)
-                    if queued_bytes + size > MAX_MESSAGE_BYTES:
-                        await error("websocket_request_queue_full", stream_id, 429)
+                    message = await websocket.receive()
+                    if message["type"] == "websocket.disconnect":
+                        break
+                    if message.get("text") is None:
+                        await error("text_frame_required")
                         continue
-                    lanes[stream_id].put_nowait((event, size))
-                    queued_bytes += size
-                except (ValueError, UnicodeError, RecursionError) as exc:
-                    code = str(exc) if isinstance(exc, ProtocolError) else "invalid_json"
-                    await error(code, stream_id, 413 if code == "request_too_large" else 400)
-        except (WebSocketDisconnect, OSError):
-            pass
-        finally:
-            group.cancel_scope.cancel()
+                    stream_id = None
+                    try:
+                        raw = message["text"].encode()
+                        message = None
+                        size = len(raw)
+                        if size > MAX_MESSAGE_BYTES:
+                            raise ProtocolError("request_too_large")
+                        if queued_items >= MAX_QUEUE_ITEMS or queued_bytes + size > MAX_MESSAGE_BYTES or resources.socket_queue_bytes + size > MAX_SHARED_BYTES:
+                            await error("websocket_request_queue_full", status=429)
+                            continue
+                        event = request_json(raw)
+                        if not isinstance(event, dict) or event.get("type") != "response.create":
+                            raise ProtocolError("unsupported_websocket_event")
+                        stream_id = event.get("stream_id")
+                        if "stream_id" in event and (not isinstance(stream_id, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,256}", stream_id)):
+                            stream_id = None
+                            raise ProtocolError("invalid_stream_id")
+                        if stream_id not in lanes:
+                            if stream_id is not None and len([key for key in lanes if key is not None]) >= 32:
+                                raise ProtocolError("websocket_stream_limit_reached")
+                            lanes[stream_id] = asyncio.Queue()
+                            group.start_soon(worker, lanes[stream_id], stream_id)
+                        del event
+                        lanes[stream_id].put_nowait((raw, size))
+                        queued_bytes += size
+                        resources.socket_queue_bytes += size
+                        queued_items += 1
+                    except (ValueError, UnicodeError, RecursionError) as exc:
+                        code = str(exc) if isinstance(exc, ProtocolError) else "invalid_json"
+                        await error(code, stream_id, 413 if code == "request_too_large" else 400)
+                    finally:
+                        raw = None
+                        event = None
+            except (WebSocketDisconnect, OSError):
+                pass
+            finally:
+                group.cancel_scope.cancel()
+    finally:
+        resources.socket_queue_bytes -= queued_bytes
+        resources.socket_history_bytes -= sum(h.size for h in histories.values())

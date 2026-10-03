@@ -2,26 +2,48 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
 import sqlite3
 import threading
 import time
 import uuid
+import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .pricing import price_usage, price_period
+from .private_files import create_private, private_directory, restrict
+
+MAX_BINDINGS = 100_000
+BINDING_TTL = 30 * 86400
 
 
 class Store:
     def __init__(self, path: str, master_key: str):
         self.lock = threading.RLock()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.cipher = Fernet(master_key.encode())
+        self.session_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+            info=b"ark-plan-gateway/admin-session/v1").derive(base64.urlsafe_b64decode(master_key))
+        if path != ":memory:":
+            target = Path(path).absolute()
+            protected = {Path.cwd().resolve(), Path.home().resolve(), Path(tempfile.gettempdir()).resolve(), target.parent.parent.resolve()}
+            allowed = {target.name, target.name + "-wal", target.name + "-shm", target.name + "-journal"}
+            if target.parent.resolve() in protected or (target.parent.exists() and any(p.name not in allowed for p in target.parent.iterdir())):
+                raise ValueError("database requires a dedicated private directory")
+            private_directory(target.parent)
+            if not target.exists():
+                with create_private(target):
+                    pass
+            for sibling in (target, Path(str(target) + "-wal"), Path(str(target) + "-shm"), Path(str(target) + "-journal")):
+                if sibling.exists():
+                    restrict(sibling)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.cipher = Fernet(master_key.encode())
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS accounts (
           id TEXT PRIMARY KEY, plan TEXT NOT NULL, label TEXT NOT NULL,
@@ -38,6 +60,7 @@ class Store:
           created_at REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS response_bindings_age ON response_bindings(created_at);
         CREATE TABLE IF NOT EXISTS model_blocks (
           account_id TEXT NOT NULL, model TEXT NOT NULL, kind TEXT NOT NULL,
           retry_at REAL, code TEXT NOT NULL, failures INTEGER NOT NULL,
@@ -82,7 +105,19 @@ class Store:
         self.db.execute("INSERT OR IGNORE INTO settings VALUES ('hourly_started_at', ?)", (str(time.time()),))
         self._last_pruned_day = ""
         self._prune_locked(time.time())
+        self.db.execute("DELETE FROM settings WHERE key='session_secret'")
+        self._binding_count = self.db.execute("SELECT COUNT(*) FROM response_bindings").fetchone()[0]
+        self._prune_bindings_locked(time.time())
         self.db.commit()
+
+    def _prune_bindings_locked(self, now: float) -> None:
+        deleted = self.db.execute("DELETE FROM response_bindings WHERE created_at < ?", (now - BINDING_TTL,)).rowcount
+        self._binding_count -= deleted
+        if self._binding_count > MAX_BINDINGS:
+            deleted = self.db.execute("DELETE FROM response_bindings WHERE response_id IN "
+                "(SELECT response_id FROM response_bindings ORDER BY created_at,response_id LIMIT ?)",
+                (self._binding_count - MAX_BINDINGS,)).rowcount
+            self._binding_count -= deleted
 
     def _prune_locked(self, now: float) -> None:
         today = time.strftime("%Y-%m-%d", time.gmtime(now))
@@ -176,9 +211,17 @@ class Store:
                 self.db.execute("DELETE FROM model_blocks WHERE account_id=? AND model=?", (account_id, model))
 
     def bind(self, response_id: str, account_id: str) -> None:
+        if not isinstance(response_id, str) or not 0 < len(response_id) <= 256:
+            raise ValueError("invalid upstream response ID")
         with self.lock:
-            self.db.execute("INSERT OR REPLACE INTO response_bindings VALUES (?,?,?)", (response_id, account_id, time.time()))
+            now = time.time()
+            self._binding_count += self.db.execute("INSERT OR IGNORE INTO response_bindings VALUES (?,?,?)", (response_id, account_id, now)).rowcount
+            self._prune_bindings_locked(now)
             self.db.commit()
+
+    def unbind(self, response_id: str) -> None:
+        with self.lock, self.db:
+            self._binding_count -= self.db.execute("DELETE FROM response_bindings WHERE response_id=?", (response_id,)).rowcount
 
     def record_request(self, account_id: str, outcome: str, latency_ms: int,
                        model: str = "",
@@ -241,7 +284,8 @@ class Store:
 
     def lookup_binding(self, response_id: str) -> str | None:
         with self.lock:
-            row = self.db.execute("SELECT account_id FROM response_bindings WHERE response_id=?", (response_id,)).fetchone()
+            row = self.db.execute("SELECT account_id FROM response_bindings WHERE response_id=? AND created_at >= ?",
+                                  (response_id, time.time() - BINDING_TTL)).fetchone()
             return row[0] if row else None
 
     def setting(self, key: str, default: str = "") -> str:
