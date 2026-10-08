@@ -98,7 +98,7 @@ def test_ntfs_alternate_stream_rejected_before_writing(tmp_path):
     assert actual.GetAce(0)[2] == everyone
 
 
-def test_database_sidecars_private_and_shared_directory_rejected(setup, tmp_path):
+def test_database_sidecars_private_and_shared_directory_supported(setup, tmp_path):
     database, _ = setup
     folder = tmp_path / 'data'
     assert_private(folder, True)
@@ -108,9 +108,41 @@ def test_database_sidecars_private_and_shared_directory_rejected(setup, tmp_path
     shared.mkdir()
     (shared / 'unrelated.txt').write_text('retain')
     before = shared.stat().st_mode
-    with pytest.raises(ValueError, match='dedicated'):
-        Store(str(shared / 'gateway.db'), Fernet.generate_key().decode())
-    assert shared.stat().st_mode == before and not (shared / 'gateway.db').exists()
+    master = Fernet.generate_key().decode()
+    database = Store(str(shared / 'gateway.db'), master)
+    account = database.add_account('agent', 'persisted-key')
+    database.close()
+    assert shared.stat().st_mode == before and (shared / 'unrelated.txt').read_text() == 'retain'
+    database = Store(str(shared / 'gateway.db'), master)
+    try:
+        assert database.account(account, private=True)['api_key'] == 'persisted-key'
+    finally:
+        database.close()
+
+
+def test_database_in_current_directory_does_not_change_directory_or_database_permissions(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    before = tmp_path.stat().st_mode
+    master = Fernet.generate_key().decode()
+    database = Store('gateway.db', master)
+    account = database.add_account('agent', 'existing-key')
+    database.close()
+    target = tmp_path / 'gateway.db'
+    if os.name == 'nt':
+        import win32security
+        get_acl = lambda: win32security.GetNamedSecurityInfo(str(target), win32security.SE_FILE_OBJECT,
+            win32security.DACL_SECURITY_INFORMATION).GetSecurityDescriptorDacl().GetAce(0)
+        database_permissions = get_acl()
+    else:
+        target.chmod(0o640)
+        database_permissions = target.stat().st_mode
+    database = Store('gateway.db', master)
+    try:
+        assert database.account(account, private=True)['api_key'] == 'existing-key'
+        assert tmp_path.stat().st_mode == before
+        assert (get_acl() if os.name == 'nt' else target.stat().st_mode) == database_permissions
+    finally:
+        database.close()
 
 
 @pytest.mark.asyncio
@@ -385,18 +417,18 @@ def test_sse_partial_line_scan_only_visits_new_bytes(monkeypatch):
     assert scanned == 10_000 and isinstance(decoder.buffer, bytearray)
 
 
-def test_json_depth_limit_before_materialization_preserves_quoted_braces(monkeypatch):
-    monkeypatch.setattr(protocols, 'MAX_JSON_DEPTH', 10)
+def test_standard_json_parser_accepts_nested_documents_and_quoted_braces():
     value = {'text': '[{' * 1000 + '\\"', 'nested': [[{'a': 'ok'}]]}
     assert protocols.request_json(json.dumps(value)) == value
+    raw = b'[' * 300 + b'0' + b']' * 300
+    assert protocols.request_json(raw) == json.loads(raw)
     with pytest.raises(ProtocolError):
-        protocols.request_json(b'[' * 11 + b'0' + b']' * 11)
+        protocols.request_json(b'[' * 10000 + b'0' + b']' * 10000)
 
 
 @pytest.mark.parametrize('encoding', ['utf-16', 'utf-32'])
-def test_alternate_json_encoding_cannot_bypass_depth_guard(monkeypatch, encoding):
-    monkeypatch.setattr(protocols, 'MAX_JSON_DEPTH', 10)
-    payload = '["\\\"",' + '[' * 11 + '0' + ']' * 11 + ']'
+def test_non_utf8_json_is_rejected(encoding):
+    payload = '{"model":"m","input":"hello"}'
     with pytest.raises(ProtocolError):
         protocols.request_json(payload.encode(encoding))
 

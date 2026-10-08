@@ -24,7 +24,7 @@ docker compose up -d --build
 
 单实例运行，持久卷为 `./data`。若从 GHCR 拉取已发布镜像，先运行 `docker pull ghcr.io/2018wzh/ark-plan-gateway:latest`，再运行 `docker compose up -d --no-build`。公开服务时须通过反向代理启用 HTTPS，并设置可信访问控制。
 
-数据库必须使用独立目录，目录中只放该数据库及其 SQLite 辅助文件；启动时会拒绝共享目录，并收紧已有文件权限。POSIX 使用目录 `0700`、文件 `0600`，Windows 使用仅允许运行用户访问的 ACL；权限设置失败时停止启动。配置文件在写入密钥前已限制权限。管理会话签名从外部主密钥派生，不在数据库保存签名密钥；升级到此实现后需重新登录，正常重启不影响有效会话。
+数据库位置通过 `ARK_GATEWAY_DB` 配置，默认 `data/gateway.db`。启动时按需创建目录和数据库，不扫描同目录的其他文件，不要求独占目录，也不改写已有目录或文件的权限；实际读写权限由操作系统和 SQLite 判断。新建私有目录和文件在 POSIX 分别使用 `0700`、`0600`，Windows 使用仅允许运行用户访问的 ACL。已有数据目录及数据库的访问权限由部署者管理。配置文件在写入密钥前已限制权限。管理会话签名从外部主密钥派生，不在数据库保存签名密钥；升级到此实现后需重新登录，正常重启不影响有效会话。
 
 ## 管理界面
 
@@ -102,7 +102,7 @@ if response.status_code == 429:
 
 套餐耗尽错误 `AccountQuotaExceeded`、Coding Plan 的 `QuotaExceeded` 与 Agent Plan 的 `QuotaExceeded.AgentPlanQuotaExceeded` 按原样返回，并暂停同一配额组，尝试其他可用组；账号切换最终失败时返回最后一次上游错误。重置时间以明确的上游时间或 `Retry-After` 为准，支持 `+0800 CST` 等带数字时区的格式；没有可信时间时保持配额暂停，等待额度刷新或手动恢复。内部分类只影响账号调度和管理页，不增加下游字段。SSE 错误事件原样转发，上游已发出明确错误后不追加网关错误；成功响应与 SSE 也保留上游端到端响应头。
 
-没有上游响应可供返回时，网关自身错误沿用方舟错误体结构与 `BadRequest`、`Unauthorized`、`Forbidden`、`TooManyRequests`、`InternalServerError` 等类型。自身错误码使用 `Gateway.` 前缀，例如 `Gateway.invalid_tool_arguments`、`Gateway.plan_pool_cooling_down`；这是网关的错误码，不冒充字节官方错误码，不伪造上游 Request ID。`/v1/` 的鉴权、404 和 405 错误也使用该结构；管理界面 `/api/` 的错误不属于推理协议。
+没有上游响应可供返回时，网关自身错误沿用方舟错误体结构与 `BadRequest`、`Unauthorized`、`Forbidden`、`TooManyRequests`、`InternalServerError` 等类型。自身错误码使用 `Gateway.` 前缀，例如 `Gateway.model_required`、`Gateway.plan_pool_cooling_down`；这是网关的错误码，不冒充字节官方错误码，不伪造上游 Request ID。`/v1/` 的鉴权、404 和 405 错误也使用该结构；管理界面 `/api/` 的错误不属于推理协议。
 
 按 [HTTP 代理规则](https://www.rfc-editor.org/rfc/rfc9110.html#section-7.6.1)移除逐跳头及 `Connection` 指定的字段。上游响应经过解压或 SSE 汇总时，不沿用失效的编码、长度或内容校验头。必须进行的适配仅包括账号路由和鉴权、模型别名、上游强制 SSE 的请求方式、非流式汇总及 WebSocket 传输；不重写提示词、工具输出或上游错误含义。
 
@@ -237,6 +237,8 @@ python scripts/import_pricing.py
 
 `InvalidParameter` 属于请求错误：同一请求不切换账号、不自动重放，也不将账号标记为额度冷却。返回 `retryable: false` 和 `requires_request_change: true`。独立的下游重复请求仍是新的请求，客户端必须修正输入后再发起。
 
-网关在发送前检查 Responses `input[].function_call` 和 Chat `messages[].tool_calls` 中完整的函数参数 JSON，发现损坏时返回 `400 Gateway.invalid_tool_arguments` 及字段位置，不把同一损坏历史继续发送给供应商。不修改工具参数、不伪造工具执行结果，也不校验流式参数片段或 custom 工具的自由格式输入。原生压缩请求不经过该生成历史校验。
+网关不二次解析或校验 Responses `input[].function_call` 和 Chat `messages[].tool_calls` 中的工具参数，不检查 Chat 消息语义，也不修改工具参数或伪造工具执行结果；供应商负责这些字段的合法性并返回自己的错误。Chat `stream_options` 为对象时仅添加用量请求选项，其他类型原样交由上游处理。网关只检查本地路由和传输适配实际需要的字段，例如模型名、流式开关和响应绑定。
+
+HTTP 管理与推理接口统一在入口中间件鉴权，路由不重复鉴权；WebSocket 在连接时单独鉴权，每帧的路由校验结果直接用于生成。JSON 使用 Python 标准解析器，不另外扫描或限制为 256 层；保留无效 JSON、非 UTF-8、非有限数字和无法编码字符串的错误处理，以及请求、事件、队列和历史缓存的大小限制。
 
 Codex 遇到工具解析失败后连续出现 400，需要结合脱敏的供应商错误确认工具历史、调用/结果对应关系或服务端上下文是否有效。网关不会通过切换账号或自动修补 JSON 改变调用语义。

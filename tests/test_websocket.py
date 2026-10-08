@@ -167,7 +167,9 @@ def test_websocket_failover_and_request_scoped_errors(setup):
 
     def upstream(request):
         calls.append(json.loads(request.content))
-        if len(calls) == 1:
+        if calls[-1].get('input') == [{'type': 'function_call', 'arguments': '{bad'}]:
+            return httpx.Response(400, json={'error': {'code': 'InvalidParameter.ToolArguments', 'message': 'upstream validation'}})
+        if len(calls) == 2:
             return httpx.Response(503, json={'error': {'code': 'ServerOverloaded'}})
         return httpx.Response(200, stream=EventStream([completed()]), headers={'content-type': 'text/event-stream'})
 
@@ -177,10 +179,10 @@ def test_websocket_failover_and_request_scoped_errors(setup):
                       'input': [{'type': 'function_call', 'arguments': '{bad'}]})
         error = ws.receive_json()
         assert error['type'] == 'error' and error['status'] == 400 and error['stream_id'] == 'main'
-        assert error['error']['code'] == 'Gateway.invalid_tool_arguments' and not calls
+        assert error['error']['code'] == 'InvalidParameter.ToolArguments' and len(calls) == 1
         ws.send_json({'type': 'response.create', 'model': 'm', 'input': 'test', 'stream_id': 'main'})
         assert ws.receive_json()['stream_id'] == 'main'
-    assert len(calls) == 2 and all('stream_id' not in body for body in calls)
+    assert len(calls) == 3 and all('stream_id' not in body for body in calls)
 
 
 @pytest.mark.parametrize('event,code', [

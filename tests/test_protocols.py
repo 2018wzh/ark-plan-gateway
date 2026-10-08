@@ -302,9 +302,7 @@ async def test_models_list_and_validation(setup):
             assert [m['id'] for m in result['data']] == ['alias', 'cooling', 'm']
             assert all(isinstance(m['created'], int) and m['object'] == 'model' for m in result['data'])
             assert (await client.post('/v1/chat/completions', json={})).status_code == 401
-            for body in ({}, [], {"model": "m"}, {"model": "m", "messages": []},
-                         {"model": "m", "messages": [{}], "stream": "true"},
-                         {"model": "m", "messages": [{}], "stream_options": []}):
+            for body in ({}, [], {"model": "m", "messages": [{}], "stream": "true"}):
                 assert (await client.post('/v1/chat/completions', headers=AUTH, json=body)).status_code == 400
             response = await client.post('/v1/chat/completions', headers=AUTH,
                                          json={"model": "cooling", "messages": [{"role": "user", "content": "test"}]})
@@ -312,6 +310,30 @@ async def test_models_list_and_validation(setup):
             assert response.json()['error']['code'] == 'Gateway.plan_pool_cooling_down'
             assert int(response.headers['retry-after']) > 0
             assert 'metadata' not in response.json()['error']
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fields', [{}, {'messages': []}, {'messages': 'invalid'},
+    {'messages': [{}], 'stream_options': []}, {'messages': [{}], 'stream_options': None}])
+async def test_chat_payload_errors_are_returned_from_upstream(setup, fields):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
+    store.add_account('coding', 'b', models=['m'])
+    calls = []
+    error = {'error': {'code': 'MissingParameter', 'param': 'messages', 'message': 'upstream detail'}}
+    def upstream(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(400, json=error, headers={'x-request-id': 'provider-validation-id'})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/chat/completions', headers=AUTH, json={'model': 'm', **fields})
+    assert response.status_code == 400 and response.json() == error and len(calls) == 1
+    assert response.headers['x-request-id'] == 'provider-validation-id'
+    for key, value in fields.items():
+        assert calls[0][key] == value
+    if 'messages' not in fields:
+        assert 'messages' not in calls[0]
+    assert all(a['enabled'] and not a['model_blocks'] and a['cooldown_kind'] is None for a in store.accounts())
 
 
 @pytest.mark.asyncio
@@ -566,14 +588,15 @@ async def test_daily_quota_stream_error_cools_account_without_replay(setup, stre
 @pytest.mark.asyncio
 @pytest.mark.parametrize('chat', [False, True])
 @pytest.mark.parametrize('arguments', ['{"broken":', '', '{"number":NaN}', {'not': 'a string'}])
-async def test_invalid_tool_history_never_reaches_provider(setup, chat, arguments):
+async def test_tool_argument_validation_is_left_to_upstream(setup, chat, arguments):
     store, create_app = setup
     store.add_account('agent', 'a', models=['m'])
     store.add_account('coding', 'b', models=['m'])
     calls = []
+    error_body = {'error': {'code': 'InvalidParameter.ToolArguments', 'param': 'arguments', 'message': 'upstream validation'}}
     def upstream(request):
-        calls.append(request)
-        return httpx.Response(400)
+        calls.append(json.loads(request.content))
+        return httpx.Response(400, json=error_body)
     body = {'model': 'm'}
     if chat:
         body['messages'] = [{'role': 'assistant', 'tool_calls': [{'id': 'private-call', 'type': 'function', 'function': {'name': 'private-tool', 'arguments': arguments}}]}]
@@ -584,12 +607,10 @@ async def test_invalid_tool_history_never_reaches_provider(setup, chat, argument
             for _ in range(2):
                 response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH, json=body)
                 assert response.status_code == 400
-                error = response.json()['error']
-                assert error['code'] == 'Gateway.invalid_tool_arguments'
-                assert 'metadata' not in error
-                assert 'arguments' in error['param']
-                assert 'private-' not in response.text
-    assert calls == []
+                assert response.json() == error_body
+    assert len(calls) == 2
+    field = 'messages' if chat else 'input'
+    assert all(call[field] == body[field] for call in calls)
     assert all(a['cooldown_kind'] is None and not a['model_blocks'] for a in store.accounts())
 
 
@@ -827,25 +848,27 @@ async def test_flat_stream_parameter_error_does_not_quarantine_model(setup, stre
     assert store.account(aid)['cooldown_kind'] is None
 
 
-def test_valid_tool_history_is_not_rewritten():
-    from gateway.protocols import invalid_tool_arguments
+@pytest.mark.asyncio
+@pytest.mark.parametrize('chat', [False, True])
+async def test_tool_history_is_not_rewritten(setup, chat):
+    store, create_app = setup
+    store.add_account('agent', 'a', models=['m'])
     arguments = '{"text":"你好", "nested":{"items":[1,2]}}'
-    chat = {'messages':[{'role':'assistant','tool_calls':[{'type':'function','function':{'name':'f','arguments':arguments}}]}]}
-    responses = {'input':[{'type':'function_call','arguments':arguments},{'type':'function_call_output','output':'plain text'}], 'previous_response_id':'resp_previous'}
-    before = json.dumps([chat,responses])
-    assert invalid_tool_arguments(chat, True) is None
-    assert invalid_tool_arguments(responses, False) is None
-    assert json.dumps([chat,responses]) == before
-
-
-def test_codex_custom_tool_and_server_context_are_not_json_validated():
-    from gateway.protocols import invalid_tool_arguments
-    data = {'previous_response_id': 'resp_previous', 'input': [
+    messages = [{'role':'assistant','tool_calls':[{'type':'function','function':{'name':'f','arguments':arguments}}]}]
+    inputs = [{'type':'function_call','arguments':arguments},{'type':'function_call_output','output':'plain text'},
         {'type': 'custom_tool_call', 'name': 'apply_patch', 'input': '*** Begin Patch'},
         {'type': 'custom_tool_call_output', 'call_id': 'call_a', 'output': 'failed to parse'},
-        {'type': 'function_call_output', 'call_id': 'call_b', 'output': 'tool parse error'},
-    ]}
-    assert invalid_tool_arguments(data, False) is None
+        {'type': 'function_call_output', 'call_id': 'call_b', 'output': 'tool parse error'}]
+    body = {'model': 'm', 'messages' if chat else 'input': messages if chat else inputs}
+    calls = []
+    def upstream(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(200, json={'id': 'resp_tools', 'output': []})
+    async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as remote:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(store, remote)), base_url='http://test') as client:
+            response = await client.post('/v1/chat/completions' if chat else '/v1/responses', headers=AUTH, json=body)
+            assert response.status_code == 200
+    assert calls[0]['messages' if chat else 'input'] == body['messages' if chat else 'input']
 
 
 @pytest.mark.asyncio

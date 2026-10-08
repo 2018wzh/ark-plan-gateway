@@ -11,7 +11,7 @@ from collections import OrderedDict
 
 import anyio
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .protocols import ProtocolError, SSEDecoder, request_json
 from .errors import gateway_error
@@ -156,9 +156,9 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
             await error(str(exc) if isinstance(exc, ProtocolError) else "invalid_json", stream_id)
             return
 
-        rejected = validate(body)
-        if rejected is not None:
-            await send_rejection(rejected, stream_id)
+        validated = validate(body)
+        if isinstance(validated, Response):
+            await send_rejection(validated, stream_id)
             return
         if warmup:
             response = {"id": "resp_ws_warmup_" + secrets.token_hex(12), "object": "response",
@@ -171,7 +171,7 @@ async def serve_responses(websocket: WebSocket, validate, generate, resources):
             await send({"type": "response.completed", "sequence_number": 1, "response": response}, stream_id)
             return
 
-        result = await generate(body, binding_id)
+        result = await generate(body, binding_id, validated)
         if not isinstance(result, StreamingResponse):
             await send_rejection(result, stream_id)
             return

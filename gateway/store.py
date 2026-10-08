@@ -8,7 +8,6 @@ import sqlite3
 import threading
 import time
 import uuid
-import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -16,7 +15,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .pricing import price_usage, price_period
-from .private_files import create_private, private_directory, restrict
+from .private_files import create_private, private_directory
 
 MAX_BINDINGS = 100_000
 BINDING_TTL = 30 * 86400
@@ -31,18 +30,11 @@ class Store:
         self.session_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
             info=b"ark-plan-gateway/admin-session/v1").derive(base64.urlsafe_b64decode(master_key))
         if path != ":memory:":
-            target = Path(path).absolute()
-            protected = {Path.cwd().resolve(), Path.home().resolve(), Path(tempfile.gettempdir()).resolve(), target.parent.parent.resolve()}
-            allowed = {target.name, target.name + "-wal", target.name + "-shm", target.name + "-journal"}
-            if target.parent.resolve() in protected or (target.parent.exists() and any(p.name not in allowed for p in target.parent.iterdir())):
-                raise ValueError("database requires a dedicated private directory")
+            target = Path(path)
             private_directory(target.parent)
             if not target.exists():
                 with create_private(target):
                     pass
-            for sibling in (target, Path(str(target) + "-wal"), Path(str(target) + "-shm"), Path(str(target) + "-journal")):
-                if sibling.exists():
-                    restrict(sibling)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")

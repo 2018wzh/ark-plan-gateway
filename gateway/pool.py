@@ -108,7 +108,7 @@ class AccountPool:
                 self.inflight[account["id"]] = self.inflight.get(account["id"], 0) + 1
                 return True
             keys = self._keys(current, model)
-            if keys & self.probing or not current["enabled"]:
+            if keys & self.probing:
                 return False
             accounts = self.store.accounts()
             kind, until = self._state(current, model, accounts)

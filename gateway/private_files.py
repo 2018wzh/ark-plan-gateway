@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import stat
 from pathlib import Path
 
 
@@ -28,47 +27,15 @@ def _attributes(directory=False):
     return attributes
 
 
-def restrict(path: Path, directory=False) -> None:
-    _reject_stream(path)
-    if path.is_symlink():
-        raise PermissionError("secret storage cannot be a symbolic link")
-    if os.name == "nt":
-        import win32security
-        acl = _attributes(directory).SECURITY_DESCRIPTOR.GetSecurityDescriptorDacl()
-        owner = win32security.GetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT,
-                                                  win32security.OWNER_SECURITY_INFORMATION).GetSecurityDescriptorOwner()
-        if owner != _attributes().SECURITY_DESCRIPTOR.GetSecurityDescriptorOwner():
-            raise PermissionError("secret storage must belong to the gateway user")
-        win32security.SetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT,
-            win32security.DACL_SECURITY_INFORMATION | win32security.PROTECTED_DACL_SECURITY_INFORMATION,
-            None, None, acl, None)
-        actual = win32security.GetNamedSecurityInfo(str(path), win32security.SE_FILE_OBJECT,
-                                                  win32security.DACL_SECURITY_INFORMATION)
-        if not actual.GetSecurityDescriptorControl()[0] & win32security.SE_DACL_PROTECTED:
-            raise PermissionError("secret storage permissions could not be restricted")
-        got = actual.GetSecurityDescriptorDacl()
-        if got is None or got.GetAceCount() != 1 or got.GetAce(0) != acl.GetAce(0):
-            raise PermissionError("secret storage permissions could not be restricted")
-    else:
-        info = path.stat()
-        if info.st_uid != os.geteuid():
-            raise PermissionError("secret storage must belong to the gateway user")
-        mode = 0o700 if directory else 0o600
-        path.chmod(mode)
-        if stat.S_IMODE(path.stat().st_mode) != mode:
-            raise PermissionError("secret storage permissions could not be restricted")
-
-
 def private_directory(path: Path) -> None:
-    _reject_stream(path)
     if not path.exists():
+        _reject_stream(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         if os.name == "nt":
             import win32file
             win32file.CreateDirectory(str(path), _attributes(True))
         else:
             path.mkdir(mode=0o700)
-    restrict(path, directory=True)
 
 
 def create_private(path: Path):

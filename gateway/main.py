@@ -22,7 +22,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.staticfiles import StaticFiles
 
 from .pool import AccountPool, classify_error
-from .protocols import ProtocolError, SSEDecoder, StreamResult, invalid_tool_arguments, request_json
+from .protocols import ProtocolError, SSEDecoder, StreamResult, request_json
 from .errors import gateway_error, safe_error_code
 from .store import Store
 from .limits import Admission, BodyTooLarge, LoginThrottle, SecurityBoundary, bounded_response, decoded_chunks
@@ -288,19 +288,16 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return {"ok": True}
 
     @app.post("/api/logout")
-    async def logout(request: Request, response: Response):
-        require_admin(request, True)
+    async def logout(response: Response):
         response.delete_cookie("ark_gateway_session")
         return {"ok": True}
 
     @app.get("/api/accounts")
-    async def accounts(request: Request):
-        require_admin(request)
+    async def accounts():
         return store.accounts()
 
     @app.post("/api/accounts")
-    async def add_account(body: AccountIn, request: Request):
-        require_admin(request, True)
+    async def add_account(body: AccountIn):
         if not body.models or any(k not in body.models or not v for k, v in body.model_mapping.items()):
             raise HTTPException(400, "model mapping must use configured model names")
         if bool(body.access_key) != bool(body.secret_key):
@@ -314,19 +311,18 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return store.account(account_id)
 
     @app.patch("/api/accounts/{account_id}")
-    async def edit_account(account_id: str, body: AccountPatch, request: Request):
-        require_admin(request, True)
+    async def edit_account(account_id: str, body: AccountPatch):
         previous = store.account(account_id)
         if not previous:
             raise HTTPException(404, "account not found")
         data = body.model_dump(exclude_unset=True)
         if "quota_group" in data:
             parent = store.account(data["quota_group"])
-            if not parent or parent["plan"] != store.account(account_id)["plan"]:
+            if not parent or parent["plan"] != previous["plan"]:
                 raise HTTPException(400, "quota group must refer to an account in the same plan")
-        if "models" in data and (not data["models"] or not all(isinstance(x, str) and x for x in data["models"])):
+        if "models" in data and (not data["models"] or not all(data["models"])):
             raise HTTPException(400, "models required")
-        if "model_mapping" in data and any(k not in (data.get("models") or store.account(account_id)["models"]) or not v for k,v in data["model_mapping"].items()):
+        if "model_mapping" in data and any(k not in (data.get("models") or previous["models"]) or not v for k,v in data["model_mapping"].items()):
             raise HTTPException(400, "model mapping must use configured model names")
         try:
             store.update(account_id, **data)
@@ -339,23 +335,20 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return store.account(account_id)
 
     @app.post("/api/accounts/check")
-    async def check_accounts(body: BatchCheckIn, request: Request):
-        require_admin(request, True)
+    async def check_accounts(body: BatchCheckIn):
         account_ids = list(dict.fromkeys(body.account_ids))
         if any(store.account(account_id) is None for account_id in account_ids):
             raise HTTPException(404, "account not found")
         return {"results": await checks.batch(account_ids)}
 
     @app.post("/api/accounts/{account_id}/check")
-    async def check_account(account_id: str, request: Request):
-        require_admin(request, True)
+    async def check_account(account_id: str):
         if store.account(account_id) is None:
             raise HTTPException(404, "account not found")
         return await checks.check(account_id)
 
     @app.post("/api/accounts/{account_id}/refresh")
-    async def refresh(account_id: str, request: Request):
-        require_admin(request, True)
+    async def refresh(account_id: str):
         account = store.account(account_id, True)
         if not account:
             raise HTTPException(404, "account not found")
@@ -364,8 +357,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return store.account(account_id)
 
     @app.post("/api/accounts/{account_id}/resume")
-    async def resume(account_id: str, request: Request):
-        require_admin(request, True)
+    async def resume(account_id: str):
         account = store.account(account_id)
         if not account:
             raise HTTPException(404, "account not found")
@@ -376,13 +368,11 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return store.account(account_id)
 
     @app.get("/api/settings")
-    async def settings(request: Request):
-        require_admin(request)
+    async def settings():
         return {"refresh_seconds": int(store.setting("refresh_seconds")), "service_token_configured": True}
 
     @app.patch("/api/settings")
-    async def edit_settings(body: SettingsIn, request: Request):
-        require_admin(request, True)
+    async def edit_settings(body: SettingsIn):
         if body.refresh_seconds is not None:
             store.set_setting("refresh_seconds", str(body.refresh_seconds))
         if body.new_password:
@@ -392,8 +382,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return {"ok": True}
 
     @app.get("/api/routes")
-    async def routes(request: Request):
-        require_admin(request)
+    async def routes():
         rows = store.accounts()
         now = time.time()
         for a in rows:
@@ -402,8 +391,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return rows
 
     @app.get("/api/statistics")
-    async def statistics(request: Request, account_id: str | None = None, days: int = 30):
-        require_admin(request)
+    async def statistics(account_id: str | None = None, days: int = 30):
         if days < 1 or days > 90:
             raise HTTPException(400, "days must be between 1 and 90")
         try:
@@ -412,23 +400,20 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             raise HTTPException(404, "account not found")
 
     @app.get("/api/pricing")
-    async def pricing(request: Request):
-        require_admin(request)
+    async def pricing():
         return store.pricing()
 
     @app.get("/api/audit")
-    async def audit_history(request: Request, days: int = Query(7, ge=1, le=30),
+    async def audit_history(days: int = Query(7, ge=1, le=30),
             limit: int = Query(50, ge=1, le=200), before: int | None = Query(None, ge=1),
             errors_only: bool = True, source: str | None = Query(None, pattern="^(upstream|gateway|client)$"),
             error_code: str | None = Query(None, max_length=128), model: str | None = Query(None, max_length=128),
             http_status: int | None = Query(None, ge=100, le=599), request_id: str | None = Query(None, max_length=128)):
-        require_admin(request)
         return await anyio.to_thread.run_sync(lambda: store.audit_history(days, limit, before, errors_only,
             source, error_code, model, http_status, request_id))
 
     @app.put("/api/pricing")
-    async def edit_pricing(body: PricingIn, request: Request):
-        require_admin(request, True)
+    async def edit_pricing(body: PricingIn):
         store.set_pricing(body.model_dump(exclude_none=True))
         return store.pricing()
 
@@ -437,8 +422,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return {"ok": True}
 
     @app.get("/v1/models")
-    async def models(request: Request):
-        require_service(request)
+    async def models():
         names = sorted({m for a in store.accounts() if a["enabled"] and not a["auth_failed"] and not a["expired"] and a["cooldown_kind"] != "account"
                         for m in a["models"] if not (pool.model_block(a, m) and pool.model_block(a, m)["retry_at"] is None)})
         return {"object": "list", "data": [{"id": m, "object": "model", "created": 0, "owned_by": "ark-plan-gateway"} for m in names]}
@@ -509,7 +493,9 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
                     if generation:
                         account_json["stream"] = True
                         if chat:
-                            account_json["stream_options"] = {**account_json.get("stream_options", {}), "include_usage": True}
+                            options = account_json.get("stream_options", {})
+                            if isinstance(options, dict):
+                                account_json["stream_options"] = {**options, "include_usage": True}
                     account_body = json.dumps(account_json, ensure_ascii=False).encode()
                 req = client.build_request(method, url, content=account_body, headers=headers)
                 upstream = await client.send(req, stream=True)
@@ -750,14 +736,7 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return model, None
         if "stream" in data and not isinstance(data["stream"], bool):
             return error_response(400, "stream_must_be_boolean")
-        invalid_arguments = invalid_tool_arguments(data, chat)
-        if invalid_arguments:
-            return error_response(400, "invalid_tool_arguments", param=invalid_arguments)
         if chat:
-            if not isinstance(data.get("messages"), list) or not data["messages"]:
-                return error_response(400, "messages_required")
-            if "stream_options" in data and not isinstance(data["stream_options"], dict):
-                return error_response(400, "invalid_stream_options")
             return model, None
         if data.get("background"):
             return error_response(400, "background_not_supported")
@@ -770,7 +749,6 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         return model, pinned
 
     async def create_generation(request: Request, chat: bool, compact: bool = False):
-        require_service(request)
         raw = await request.body()  # SecurityBoundary already bounded the ASGI receive stream.
         try:
             data = request_json(raw)
@@ -804,13 +782,9 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             return
 
         def validate(data):
-            result = validate_generation(data, False)
-            return result if isinstance(result, Response) else None
+            return validate_generation(data, False)
 
-        async def generate(data, binding_id):
-            validated = validate_generation(data, False)
-            if isinstance(validated, Response):
-                return validated
+        async def generate(data, binding_id, validated):
             model, pinned = validated
             if binding_id:
                 pinned = store.lookup_binding(binding_id)
@@ -836,7 +810,6 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
 
     @app.api_route("/v1/responses/{response_id}", methods=["GET", "DELETE"])
     async def response_item(response_id: str, request: Request):
-        require_service(request)
         account_id = store.lookup_binding(response_id)
         if not account_id:
             return error_response(404, "response_unknown")

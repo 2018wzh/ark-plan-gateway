@@ -27,12 +27,6 @@ def main():
         if added:
             saved = client.put("/api/pricing", json=pricing)
             saved.raise_for_status()
-            actual = client.get("/api/pricing")
-            actual.raise_for_status()
-            for model in added:
-                for key, value in catalog["models"][model].items():
-                    if actual.json()["models"][model].get(key) != value:
-                        raise SystemExit(f"Import verification failed: {model}")
         print(f"Imported {len(added)} models; preserved {len(pricing['models']) - len(added)} configured models. Source: {catalog['source']}")
 
 
