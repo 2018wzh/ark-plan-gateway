@@ -28,6 +28,7 @@ from .store import Store
 from .limits import Admission, BodyTooLarge, LoginThrottle, SecurityBoundary, bounded_response, decoded_chunks
 from .websocket import serve_responses
 from .audit import AuditMiddleware, audited_request, current_audit, local_error
+from .checks import AccountChecks, MAX_BATCH
 
 AGENT_URL = "https://ark.cn-beijing.volces.com/api/plan/v3"
 CODING_URL = "https://ark.cn-beijing.volces.com/api/coding/v3"
@@ -106,6 +107,10 @@ class AccountPatch(BaseModel):
 
 class LoginIn(BaseModel):
     password: str = Field(max_length=1024)
+
+
+class BatchCheckIn(BaseModel):
+    account_ids: list[str] = Field(min_length=1, max_length=MAX_BATCH)
 
 
 class SettingsIn(BaseModel):
@@ -214,6 +219,8 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
     app.state.pool = pool
     app.state.client = client
     app.state.requests = Admission(32)
+    checks = AccountChecks(store, client, app.state.requests, {"agent": AGENT_URL, "coding": CODING_URL})
+    app.state.checks = checks
     app.state.sockets = Admission(16)
     app.state.socket_queue_bytes = 0
     app.state.socket_history_bytes = 0
@@ -330,6 +337,21 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
         if data.get("api_key"):
             store.update(account_id, auth_failed=0)
         return store.account(account_id)
+
+    @app.post("/api/accounts/check")
+    async def check_accounts(body: BatchCheckIn, request: Request):
+        require_admin(request, True)
+        account_ids = list(dict.fromkeys(body.account_ids))
+        if any(store.account(account_id) is None for account_id in account_ids):
+            raise HTTPException(404, "account not found")
+        return {"results": await checks.batch(account_ids)}
+
+    @app.post("/api/accounts/{account_id}/check")
+    async def check_account(account_id: str, request: Request):
+        require_admin(request, True)
+        if store.account(account_id) is None:
+            raise HTTPException(404, "account not found")
+        return await checks.check(account_id)
 
     @app.post("/api/accounts/{account_id}/refresh")
     async def refresh(account_id: str, request: Request):

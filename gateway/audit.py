@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 def route(path):
     path = path.rstrip("/")
+    if path == "/api/accounts/{account_id}/check":
+        return path
     if path in {"/v1/models", "/v1/responses", "/v1/responses/compact", "/v1/chat/completions"}:
         return path
     if path.startswith("/v1/responses/"):

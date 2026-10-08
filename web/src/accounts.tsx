@@ -2,7 +2,8 @@ import {Badge} from 'antd';
 import {effectiveCooldown} from './cooldown';
 
 export type Usage = {quota:number,used:number,reset_time:number|null,unit?:string};
-export type Account = {id:string,plan:string,label:string,api_key_mask:string,has_ak_sk:boolean,quota_group:string,models:string[],model_mapping:Record<string,string>,enabled:number,auth_failed:number,expired:number,cooldown_until:number|null,cooldown_kind:string|null,cooldown_code?:string|null,model_blocks?:{model:string,kind:string,retry_at:number|null,code:string}[],quota_checked_at:number|null,quota_error:string|null,usage:Record<string,Usage>,inflight?:number};
+export type AccountCheck = {account_id:string,status:'success'|'failed'|'skipped',model?:string,upstream_model?:string,checked_at?:number,duration_ms?:number,upstream_status?:number|null,source?:string,code:string,request_id?:string,disabled:boolean};
+export type Account = {id:string,plan:string,label:string,api_key_mask:string,has_ak_sk:boolean,quota_group:string,models:string[],model_mapping:Record<string,string>,enabled:number,auth_failed:number,expired:number,cooldown_until:number|null,cooldown_kind:string|null,cooldown_code?:string|null,model_blocks?:{model:string,kind:string,retry_at:number|null,code:string}[],quota_checked_at:number|null,quota_error:string|null,usage:Record<string,Usage>,inflight?:number,check?:AccountCheck|Record<string,never>};
 export const usableModels=(account:Account,now=Date.now()/1000)=>account.models.filter(m=>!account.model_blocks?.some(b=>b.model===(account.model_mapping[m]||m)&&(b.retry_at===null||b.retry_at>now)));
 export const windowName=(name:string)=>({AFPFiveHour:'5 小时',AFPDaily:'每日',AFPWeekly:'每周',AFPMonthly:'每月',session:'5 小时',weekly:'每周',monthly:'每月'}[name]||name);
 export const formatTime=(time:number|null|undefined)=>time&&time>0?new Date(time*1000).toLocaleString('zh-CN',{hour12:false}):'重置时间未知';
