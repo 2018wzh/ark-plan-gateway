@@ -334,6 +334,12 @@ def create_app(store: Store | None = None, client: httpx.AsyncClient | None = No
             store.update(account_id, auth_failed=0)
         return store.account(account_id)
 
+    @app.delete("/api/accounts/{account_id}")
+    async def remove_account(account_id: str):
+        if not store.remove_account(account_id):
+            raise HTTPException(404, "account not found")
+        return {"ok": True}
+
     @app.post("/api/accounts/check")
     async def check_accounts(body: BatchCheckIn):
         account_ids = list(dict.fromkeys(body.account_ids))

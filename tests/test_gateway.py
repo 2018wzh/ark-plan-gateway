@@ -299,6 +299,47 @@ async def test_account_editor_credentials_and_duplicate_keys(store, monkeypatch)
             assert (await client.patch(f"/api/accounts/{second}", json={"label":"updated"})).status_code == 200
 
 
+def test_remove_account_detaches_group_and_purges_private_state(store):
+    first = store.add_account("agent", "key-first", models=["m"])
+    second = store.add_account("agent", "key-second", models=["m"])
+    store.set_quota_group(second, first)
+    store.block_model(first, "m", "model", None, "UnsupportedModel", 1)
+    store.bind("resp_removed", first)
+    store.record_request(first, "success", 10, "m", 5, 2)
+    assert store.remove_account(first)
+    assert store.account(first) is None
+    assert store.account(second)["quota_group"] == second
+    assert store.lookup_binding("resp_removed") is None
+    assert store.db.execute("SELECT COUNT(*) FROM model_blocks WHERE account_id=?", (first,)).fetchone()[0] == 0
+    # Consumption history outlives the account so aggregate statistics stay complete.
+    assert sum(row["input_tokens"] for row in store.statistics(None, 1)["daily"]) == 5
+    assert not store.remove_account(first)
+
+
+@pytest.mark.asyncio
+async def test_remove_account_endpoint(store, monkeypatch):
+    monkeypatch.setenv("ARK_GATEWAY_ADMIN_PASSWORD", "admin-password-123")
+    monkeypatch.setenv("ARK_GATEWAY_SERVICE_TOKEN", "service-token-123456789012345")
+    monkeypatch.setenv("ARK_GATEWAY_ALLOW_UNCONFIGURED", "1")
+    from gateway.main import create_app
+    account = store.add_account("agent", "key-agent", models=["m"])
+    peer = store.add_account("agent", "key-peer", models=["m"])
+    store.set_quota_group(peer, account)
+    store.bind("resp_bound", account)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200))) as upstream:
+        app = create_app(store, upstream)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.delete(f"/api/accounts/{account}")).status_code == 401
+            await client.post("/api/login", json={"password":"admin-password-123"})
+            response = await client.delete(f"/api/accounts/{account}")
+            assert response.status_code == 200 and response.json() == {"ok": True}
+            assert store.account(account) is None
+            assert store.account(peer)["quota_group"] == peer
+            assert store.lookup_binding("resp_bound") is None
+            assert [a["id"] for a in (await client.get("/api/accounts")).json()] == [peer]
+            assert (await client.delete(f"/api/accounts/{account}")).status_code == 404
+
+
 def test_hourly_statistics_boundaries_prices_filter_and_restart(tmp_path, monkeypatch):
     path = str(tmp_path / "hourly.db")
     key = Fernet.generate_key().decode()

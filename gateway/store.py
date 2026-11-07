@@ -241,6 +241,17 @@ class Store:
             self.db.commit()
             return account_id
 
+    def remove_account(self, account_id: str) -> bool:
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM accounts WHERE id=?", (account_id,)).fetchone():
+                return False
+            # Remaining keys keep working with independent quota accounting.
+            self.db.execute("UPDATE accounts SET quota_group=id WHERE quota_group=? AND id<>?", (account_id, account_id))
+            self.db.execute("DELETE FROM model_blocks WHERE account_id=?", (account_id,))
+            self._binding_count -= self.db.execute("DELETE FROM response_bindings WHERE account_id=?", (account_id,)).rowcount
+            self.db.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            return True
+
     def update(self, account_id: str, **fields) -> None:
         allowed = {"plan", "label", "quota_group", "models", "model_mapping", "enabled", "auth_failed", "expired",
                    "cooldown_until", "cooldown_kind", "cooldown_failures", "cooldown_code", "quota_checked_at", "quota_error", "usage_json", "active"}

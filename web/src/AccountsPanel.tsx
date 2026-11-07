@@ -57,6 +57,20 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
       await reload();
     }catch(error){msg.error(errorText(error))}finally{running.current.delete(account.id);setPending([...running.current])}
   };
+  const remove=async(account:Account)=>{
+    if(batchRunning.current||running.current.has(account.id))return;
+    running.current.add(account.id);setPending([...running.current]);
+    try{
+      await api(`/accounts/${account.id}`,'DELETE');
+      setSelected(ids=>ids.filter(id=>id!==account.id));
+      msg.success('账号已移除');
+      await reload();
+    }catch(error){msg.error(errorText(error))}finally{running.current.delete(account.id);setPending([...running.current])}
+  };
+  const confirmRemove=(account:Account)=>{
+    const members=accounts.filter(a=>a.id!==account.id&&a.quota_group===account.id);
+    modal.confirm({title:`移除账号「${account.label}」？`,content:<>{'将删除该账号的 API Key、模型限制和上游响应绑定，且无法恢复。'}{members.length?`同一额度主体的另外 ${members.length} 个账号将改为独立额度。`:''}用量统计与请求审计记录保留。</>,okText:'移除',okButtonProps:{danger:true},cancelText:'取消',onOk:()=>remove(account)});
+  };
   const details=(account:Account)=><div className="account-details">
     {account.check?.checked_at&&<Alert type={account.check.status==='success'?'success':'error'} showIcon message={`最近检测：${account.check.status==='success'?'通过':'失败并停用'} · ${account.check.model} · ${account.check.duration_ms} ms`} description={<>{formatTime(account.check.checked_at)}{account.check.upstream_status!==null&&account.check.upstream_status!==undefined&&` · 上游 HTTP ${account.check.upstream_status}`}{account.check.code&&` · ${account.check.code}`} · 审计 ID：{account.check.request_id}</>}/>}
     {account.cooldown_code&&<Alert type="warning" showIcon message={`上游状态：${account.cooldown_code}`}/>}
@@ -96,7 +110,7 @@ export default function AccountsPanel({accounts,onEdit,reload,updatedAt}:{accoun
           {title:'操作',fixed:'right',width:225,render:(_,a)=><Space size={8}><Tooltip title={a.enabled?'停用账号':'启用账号'}><Switch size="small" aria-label={`${a.label} 启停`} checked={!!a.enabled} loading={pending.includes(a.id)} disabled={batchBusy||pending.includes(a.id)} onChange={enabled=>act(a,'toggle',enabled)}/></Tooltip>
             <Button size="small" onClick={()=>detect([a.id])} loading={pending.includes(a.id)} disabled={batchBusy||pending.includes(a.id)}>检测</Button>
             <Button size="small" onClick={()=>onEdit(a)} disabled={batchBusy||pending.includes(a.id)}>编辑</Button>
-            <Dropdown trigger={['click']} menu={{items:[{key:'refresh',label:'刷新额度'},{key:'resume',label:'手动恢复',disabled:!a.cooldown_kind&&!a.auth_failed&&!a.model_blocks?.length}],onClick:({key})=>key==='refresh'?void act(a,'refresh'):modal.confirm({title:'恢复此额度主体？',content:'将清除同一额度主体的冷却、模型隔离和鉴权失败状态；下一次请求会重新尝试上游。',okText:'恢复',cancelText:'取消',onOk:()=>act(a,'resume')})}}><Button size="small" aria-label={`${a.label} 更多操作`} icon={<MoreOutlined/>} disabled={batchBusy||pending.includes(a.id)}/></Dropdown></Space>},
+            <Dropdown trigger={['click']} menu={{items:[{key:'refresh',label:'刷新额度'},{key:'resume',label:'手动恢复',disabled:!a.cooldown_kind&&!a.auth_failed&&!a.model_blocks?.length},{type:'divider'},{key:'remove',label:'移除账号',danger:true}],onClick:({key})=>key==='refresh'?void act(a,'refresh'):key==='remove'?confirmRemove(a):modal.confirm({title:'恢复此额度主体？',content:'将清除同一额度主体的冷却、模型隔离和鉴权失败状态；下一次请求会重新尝试上游。',okText:'恢复',cancelText:'取消',onOk:()=>act(a,'resume')})}}><Button size="small" aria-label={`${a.label} 更多操作`} icon={<MoreOutlined/>} disabled={batchBusy||pending.includes(a.id)}/></Dropdown></Space>},
         ]}/>
       <div className="table-footer"><ClockCircleOutlined/> 每 15 秒自动更新 <span>上次更新：{updatedAt?new Date(updatedAt).toLocaleTimeString('zh-CN',{hour12:false}):'—'}</span></div>
     </Card>

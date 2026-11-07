@@ -183,7 +183,7 @@ async def direct_request(app, path, messages, headers=None, method='POST'):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('path,method', [('/api/accounts', 'POST'), ('/api/accounts/x', 'PATCH'),
-    ('/api/settings', 'PATCH'), ('/api/pricing', 'PUT')])
+    ('/api/accounts/x', 'DELETE'), ('/api/settings', 'PATCH'), ('/api/pricing', 'PUT')])
 async def test_management_auth_precedes_any_body_read(setup, path, method):
     database, create = setup
     async with httpx.AsyncClient() as remote:
